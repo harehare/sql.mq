@@ -20,4 +20,4 @@ jobs:
         with:
           bins: test
       - name: Run tests
-        run: mq-test sql_tests.mq
+        run: mq-test sql_tests.mq sql_import_tests.mq

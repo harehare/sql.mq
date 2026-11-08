@@ -1,0 +1,31 @@
+import "sql"
+| include "test"
+|
+
+# The module must load with `import`, which rejects duplicate definitions.
+
+def test_import_sql_ast():
+  assert_eq(sql::sql_ast("SELECT 1")[0]["type"], "select")
+end
+
+def test_import_sql_stringify():
+  assert_eq(sql::sql_stringify(sql::sql_ast("select a from t")), "SELECT a FROM t;")
+end
+
+def test_import_sql_find():
+  let names = map(sql::sql_find(sql::sql_ast("SELECT a FROM t JOIN u ON t.id = u.id"), "table"), ->(t): t["name"];)
+  | assert_eq(names, ["t", "u"])
+end
+
+def test_import_sql_parse():
+  assert_eq(sql::sql_parse("CREATE TABLE a (id INT PRIMARY KEY)")[0]["primary_key"], ["id"])
+end
+
+def test_import_sql_to_markdown():
+  assert_eq(sql::sql_to_markdown("CREATE TABLE a (x INT)"), "## a\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `INT` | YES |  |  |  |")
+end
+
+def test_import_sql_table_to_markdown():
+  let t = sql::sql_parse("CREATE TABLE a (x INT)")[0]
+  | assert_eq(starts_with(sql::sql_table_to_markdown(t), "## a"), true)
+end

@@ -2677,7 +2677,4 @@ end
 def sql_to_markdown(input):
   join(map(sql_parse(input), ->(t): sql_table_to_markdown(t);), "\n\n")
 end
-def sql_to_markdown(input):
-  join(map(sql_parse(input), ->(t): sql_table_to_markdown(t);), "\n\n")
-end
 
