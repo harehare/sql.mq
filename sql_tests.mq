@@ -1,9 +1,9 @@
 include "test"
-| include "sql"
+| import "sql"
 |
 
 def _t(sql, name):
-  first(filter(sql_parse(sql), ->(t): t["name"] == name;))
+  first(filter(sql::sql_parse(sql), ->(t): t["name"] == name;))
 end
 
 def _c(tbl, name):
@@ -91,17 +91,17 @@ end
 # -- Statements --
 
 def test_multiple_tables_and_comments_in_sql():
-  let r = sql_parse("-- c\nCREATE TABLE a (x INT); /* b */ CREATE TABLE b (y INT);")
+  let r = sql::sql_parse("-- c\nCREATE TABLE a (x INT); /* b */ CREATE TABLE b (y INT);")
   | assert_eq(map(r, ->(t): t["name"];), ["a", "b"])
 end
 
 def test_non_ddl_statements_are_ignored():
-  let r = sql_parse("INSERT INTO a VALUES (1); CREATE INDEX i ON a (x); DROP TABLE b;")
+  let r = sql::sql_parse("INSERT INTO a VALUES (1); CREATE INDEX i ON a (x); DROP TABLE b;")
   | assert_eq(r, [])
 end
 
 def test_create_if_not_exists_and_schema():
-  let r = sql_parse("CREATE TEMPORARY TABLE IF NOT EXISTS public.a (x INT);")
+  let r = sql::sql_parse("CREATE TEMPORARY TABLE IF NOT EXISTS public.a (x INT);")
   | assert_eq(first(r)["name"], "public.a")
 end
 
@@ -123,28 +123,28 @@ def test_mysql_table_comment():
 end
 
 def test_unbalanced_parentheses_is_an_error():
-  assert_eq(try: sql_parse("CREATE TABLE a (x INT") catch: "error", "error")
+  assert_eq(try: sql::sql_parse("CREATE TABLE a (x INT") catch: "error", "error")
 end
 
 # -- Markdown --
 
 def test_markdown_output():
-  let md = sql_to_markdown("CREATE TABLE a (id INT PRIMARY KEY, n TEXT DEFAULT 'x|y' COMMENT 'p|q'); COMMENT ON TABLE a IS 'Tbl';")
+  let md = sql::sql_to_markdown("CREATE TABLE a (id INT PRIMARY KEY, n TEXT DEFAULT 'x|y' COMMENT 'p|q'); COMMENT ON TABLE a IS 'Tbl';")
   | assert_eq(md, "## a\n\nTbl\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `id` | `INT` | NO |  | PK |  |\n| `n` | `TEXT` | YES | `'x\\|y'` |  | p\\|q |")
 end
 
 def test_markdown_empty_input():
-  assert_eq(sql_to_markdown("SELECT 1;"), "")
+  assert_eq(sql::sql_to_markdown("SELECT 1;"), "")
 end
 
 # -- AST: expressions --
 
 def _expr(sql):
-  first(first(sql_ast("SELECT " + sql))["columns"])["expr"]
+  first(first(sql::sql_ast("SELECT " + sql))["columns"])["expr"]
 end
 
 def _p(sql):
-  sql_stringify(sql_ast(sql))
+  sql::sql_stringify(sql::sql_ast(sql))
 end
 
 def test_ast_precedence_and_over_or():
@@ -203,7 +203,7 @@ end
 # -- AST: queries --
 
 def _sel(sql):
-  first(sql_ast(sql))
+  first(sql::sql_ast(sql))
 end
 
 def test_ast_select_clauses():
@@ -299,17 +299,17 @@ end
 # -- AST: errors and helpers --
 
 def test_ast_syntax_error():
-  assert_eq(try: sql_ast("SELECT FROM t") catch: "error", "error")
-  | assert_eq(try: sql_ast("SELECT a FROM t WHERE") catch: "error", "error")
+  assert_eq(try: sql::sql_ast("SELECT FROM t") catch: "error", "error")
+  | assert_eq(try: sql::sql_ast("SELECT a FROM t WHERE") catch: "error", "error")
 end
 
 def test_ast_trailing_tokens_error():
-  assert_eq(try: sql_ast("SELECT 1 2 3") catch: "error", "error")
+  assert_eq(try: sql::sql_ast("SELECT 1 2 3") catch: "error", "error")
 end
 
 def test_sql_find_collects_nested_nodes():
-  let ast = sql_ast("SELECT a FROM t JOIN u ON t.id = u.id WHERE x IN (SELECT y FROM v)")
-  | assert_eq(map(sql_find(ast, "table"), ->(t): t["name"];), ["t", "u", "v"])
+  let ast = sql::sql_ast("SELECT a FROM t JOIN u ON t.id = u.id WHERE x IN (SELECT y FROM v)")
+  | assert_eq(map(sql::sql_find(ast, "table"), ->(t): t["name"];), ["t", "u", "v"])
 end
 
 # -- Printer --
@@ -326,7 +326,7 @@ def test_stringify_round_trips():
     "CREATE UNIQUE INDEX i ON t (a, b DESC)",
     "DROP TABLE IF EXISTS a CASCADE"
   ]
-  | assert_eq(map(qs, ->(q): sql_stringify(sql_ast(q)[0]);), qs)
+  | assert_eq(map(qs, ->(q): sql::sql_stringify(sql::sql_ast(q)[0]);), qs)
 end
 
 def test_stringify_adds_required_parentheses():
@@ -339,13 +339,13 @@ def test_stringify_quotes_identifiers_when_needed():
 end
 
 def test_stringify_statement_array():
-  assert_eq(sql_stringify(sql_ast("SELECT 1; SELECT 2")), "SELECT 1;\nSELECT 2;")
+  assert_eq(sql::sql_stringify(sql::sql_ast("SELECT 1; SELECT 2")), "SELECT 1;\nSELECT 2;")
 end
 
 def test_stringify_ast_edited_by_hand():
-  let q = first(sql_ast("SELECT a FROM t"))
+  let q = first(sql::sql_ast("SELECT a FROM t"))
   | let edited = set(q, "where", {"type": "binary", "op": "=", "left": {"type": "ident", "parts": ["id"]}, "right": {"type": "literal", "kind": "number", "value": "1"}})
-  | assert_eq(sql_stringify(edited), "SELECT a FROM t WHERE id = 1")
+  | assert_eq(sql::sql_stringify(edited), "SELECT a FROM t WHERE id = 1")
 end
 
 # ===========================================================================
@@ -553,7 +553,7 @@ end
 #   ["SELECT * FROM \"s\".\"t\"", "SELECT * FROM \"s\".\"t\""]
 # ])
 def test_stringify_canonical(sql, expected):
-  assert_eq(sql_stringify(first(sql_ast(sql))), expected)
+  assert_eq(sql::sql_stringify(first(sql::sql_ast(sql))), expected)
 end
 
 # Printer: canonical forms are fixed points of parse then print
@@ -749,7 +749,7 @@ end
 #   ["SELECT * FROM \"s\".\"t\""]
 # ])
 def test_stringify_is_idempotent(sql):
-  assert_eq(sql_stringify(first(sql_ast(sql))), sql)
+  assert_eq(sql::sql_stringify(first(sql::sql_ast(sql))), sql)
 end
 
 # Statement node types
@@ -780,11 +780,11 @@ end
 #   ["WITH c AS (SELECT 1) SELECT 1 UNION SELECT 2", "set_op"]
 # ])
 def test_statement_type(sql, expected):
-  assert_eq(first(sql_ast(sql))["type"], expected)
+  assert_eq(first(sql::sql_ast(sql))["type"], expected)
 end
 
 def _expr_of(sql):
-  first(first(sql_ast("SELECT " + sql))["columns"])["expr"]
+  first(first(sql::sql_ast("SELECT " + sql))["columns"])["expr"]
 end
 
 # Expression structure: [expression, path into the node, expected value]
@@ -1001,7 +1001,7 @@ end
 #   ["DELETE FROM t RETURNING *", ["returning", 0, "expr", "type"], "star"]
 # ])
 def test_statement_shape(sql, path, expected):
-  assert_eq(_path(first(sql_ast(sql)), path), expected)
+  assert_eq(_path(first(sql::sql_ast(sql)), path), expected)
 end
 
 # DDL and other statements: [statement, path into the first node, expected value]
@@ -1148,7 +1148,7 @@ end
 #   ["CREATE FUNCTION f() RETURNS int AS $$ SELECT 1; SELECT 2; $$ LANGUAGE sql", ["keyword"], "create"]
 # ])
 def test_ddl_shape(sql, path, expected):
-  assert_eq(_path(first(sql_ast(sql)), path), expected)
+  assert_eq(_path(first(sql::sql_ast(sql)), path), expected)
 end
 
 # sql_find: [statement, node type, field, expected values of that field]
@@ -1196,7 +1196,7 @@ end
 #   ["WITH a AS (SELECT 1), b AS (SELECT 2) SELECT 1", "cte", "name", ["a", "b"]]
 # ])
 def test_sql_find(sql, type, field, expected):
-  assert_eq(_names(sql_find(sql_ast(sql), type), field), expected)
+  assert_eq(_names(sql::sql_find(sql::sql_ast(sql), type), field), expected)
 end
 
 # Syntax errors raise
@@ -1285,11 +1285,11 @@ end
 #   ["SELECT 1; SELECT FROM"]
 # ])
 def test_syntax_error(sql):
-  assert_eq(try: sql_ast(sql) catch: "error", "error")
+  assert_eq(try: sql::sql_ast(sql) catch: "error", "error")
 end
 
 def _schema_col(sql, table, col):
-  first(filter(first(filter(sql_parse(sql), ->(t): t["name"] == table;))["columns"], ->(c): c["name"] == col;))
+  first(filter(first(filter(sql::sql_parse(sql), ->(t): t["name"] == table;))["columns"], ->(c): c["name"] == col;))
 end
 
 # sql_parse columns: [DDL, table, column, field, expected]
@@ -1362,7 +1362,7 @@ end
 #   ["CREATE TABLE a (x INT, y TEXT, z INT)", "a", "columns|name", ["x", "y", "z"]]
 # ])
 def test_schema_table(sql, table, field, expected):
-  let t = first(filter(sql_parse(sql), ->(x): x["name"] == table;))
+  let t = first(filter(sql::sql_parse(sql), ->(x): x["name"] == table;))
   | if (field == "columns|name"): assert_eq(map(t["columns"], ->(c): c["name"];), expected) else: assert_eq(t[field], expected)
 end
 
@@ -1391,7 +1391,7 @@ end
 #   ["CREATE TABLE a (x INT); DROP TABLE a; CREATE TABLE a (y INT)", 2]
 # ])
 def test_schema_table_count(sql, expected):
-  assert_eq(len(sql_parse(sql)), expected)
+  assert_eq(len(sql::sql_parse(sql)), expected)
 end
 
 # sql_to_markdown: [DDL, expected Markdown]
@@ -1410,7 +1410,7 @@ end
 #   ["CREATE TABLE a (x INT); COMMENT ON TABLE a IS 'T'; COMMENT ON COLUMN a.x IS 'C'", "## a\n\nT\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `INT` | YES |  |  | C |"]
 # ])
 def test_markdown_output_cases(sql, expected):
-  assert_eq(sql_to_markdown(sql), expected)
+  assert_eq(sql::sql_to_markdown(sql), expected)
 end
 
 # ===========================================================================
@@ -1538,7 +1538,7 @@ end
 #   ["SELECT a FROM unnest(ARRAY[1,2]) AS u(x), generate_series(1, 2) g(n)", "SELECT a FROM unnest(ARRAY[1, 2]) AS u (x), generate_series(1, 2) AS g (n)"]
 # ])
 def test_stringify_canonical_dialects(sql, expected):
-  assert_eq(sql_stringify(first(sql_ast(sql))), expected)
+  assert_eq(sql::sql_stringify(first(sql::sql_ast(sql))), expected)
 end
 
 # Printer: canonical dialect forms are fixed points
@@ -1662,11 +1662,11 @@ end
 #   ["SELECT a FROM unnest(ARRAY[1, 2]) AS u (x), generate_series(1, 2) AS g (n)"]
 # ])
 def test_stringify_dialects_idempotent(sql):
-  assert_eq(sql_stringify(first(sql_ast(sql))), sql)
+  assert_eq(sql::sql_stringify(first(sql::sql_ast(sql))), sql)
 end
 
 def _expr_of2(sql):
-  first(first(sql_ast("SELECT " + sql))["columns"])["expr"]
+  first(first(sql::sql_ast("SELECT " + sql))["columns"])["expr"]
 end
 
 # New expression shapes: [expression, path, expected]
@@ -1796,7 +1796,7 @@ end
 #   ["ALTER TABLE t ALTER COLUMN a TYPE int USING a::int", ["actions", 0, "sql"], "ALTER COLUMN a TYPE int USING a::int"]
 # ])
 def test_statement_shape_dialects(sql, path, expected):
-  assert_eq(_path(first(sql_ast(sql)), path), expected)
+  assert_eq(_path(first(sql::sql_ast(sql)), path), expected)
 end
 
 # More syntax errors raise
@@ -1849,7 +1849,7 @@ end
 #   ["SELECT a[]"]
 # ])
 def test_syntax_error_dialects(sql):
-  assert_eq(try: sql_ast(sql) catch: "error", "error")
+  assert_eq(try: sql::sql_ast(sql) catch: "error", "error")
 end
 
 # ===========================================================================
@@ -1891,7 +1891,7 @@ end
 #   ["COMMENT ON TABLE `T` IS NULL"]
 # ])
 def test_quoted_names_round_trip(sql):
-  assert_eq(sql_stringify(first(sql_ast(sql))), sql)
+  assert_eq(sql::sql_stringify(first(sql::sql_ast(sql))), sql)
 end
 
 # Quoted names in CREATE TABLE
@@ -1901,11 +1901,11 @@ end
 #   ["CREATE TABLE T (A INT, b INT)", "CREATE TABLE T (\n  A INT,\n  b INT\n)"]
 # ])
 def test_quoted_names_create_table(sql, expected):
-  assert_eq(sql_stringify(first(sql_ast(sql))), expected)
+  assert_eq(sql::sql_stringify(first(sql::sql_ast(sql))), expected)
 end
 
 def _expr_of3(sql):
-  first(first(sql_ast("SELECT " + sql))["columns"])["expr"]
+  first(first(sql::sql_ast("SELECT " + sql))["columns"])["expr"]
 end
 
 # Quote style per name part: false for a bare word, otherwise the quote character
@@ -1970,7 +1970,7 @@ end
 #   ["COMMENT ON COLUMN \"T\".\"C\" IS 'x'", ["name_quoted"], ["\"", "\""]]
 # ])
 def test_quoted_flags_in_statements(sql, path, expected):
-  assert_eq(_path(first(sql_ast(sql)), path), expected)
+  assert_eq(_path(first(sql::sql_ast(sql)), path), expected)
 end
 
 # ===========================================================================
@@ -2018,7 +2018,7 @@ end
 #   ["CREATE INDEX i ON t (a)"]
 # ])
 def test_details_round_trip(sql):
-  assert_eq(sql_stringify(first(sql_ast(sql))), sql)
+  assert_eq(sql::sql_stringify(first(sql::sql_ast(sql))), sql)
 end
 
 # CREATE TABLE details
@@ -2043,7 +2043,7 @@ end
 #   ["CREATE TABLE a (id INT) TABLESPACE ts", "CREATE TABLE a (\n  id INT\n) TABLESPACE TS"]
 # ])
 def test_details_create_table(sql, expected):
-  assert_eq(sql_stringify(first(sql_ast(sql))), expected)
+  assert_eq(sql::sql_stringify(first(sql::sql_ast(sql))), expected)
 end
 
 # New fields: [statement, path, expected]
@@ -2124,5 +2124,5 @@ end
 #   ["SELECT * FROM a NATURAL JOIN b", ["from", 0, "inner"], false]
 # ])
 def test_details_shape(sql, path, expected):
-  assert_eq(_path(first(sql_ast(sql)), path), expected)
+  assert_eq(_path(first(sql::sql_ast(sql)), path), expected)
 end

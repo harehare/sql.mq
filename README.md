@@ -29,8 +29,10 @@ mq --allow-http-import -I raw 'import "github.com/harehare/sql.mq" | sql::sql_to
 
 ```sh
 mq -L . -I raw 'import "sql" | sql::sql_to_markdown(.)' schema.sql
-mq -L . -I raw 'include "sql" | sql_ast(.) | sql_find(., "table") | map(., fn(t): t["name"];)' query.sql
+mq -L . -I raw 'import "sql" | sql::sql_ast(.) | sql::sql_find(., "table") | map(., fn(t): t["name"];)' query.sql
 ```
+
+The module is organized into inline modules (`sql_lexer`, `sql_parser`, ...) that refer to each other as `sql::<module>::<name>`, so it must be loaded with `import "sql"` under that name. `include "sql"` is not supported.
 
 ## API
 
@@ -63,7 +65,7 @@ Quoting is kept in a sibling field named `<field>_quoted` so that printing gives
 | list of dotted names (`drop.names`, `truncate.tables`) | an array of arrays |
 
 ```sh
-mq -I raw 'include "sql" | sql_ast(.)[0]["from"][0]["name_quoted"]' <<< 'SELECT * FROM `db`.`Users`'
+mq -L . -I raw 'import "sql" | sql::sql_ast(.)[0]["from"][0]["name_quoted"]' <<< 'SELECT * FROM `db`.`Users`'
 # => ["`", "`"]
 ```
 
