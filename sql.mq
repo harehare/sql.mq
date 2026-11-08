@@ -1,0 +1,2683 @@
+# SQL parser in mq
+# Parses SQL into an AST (sql_ast), prints an AST back to SQL (sql_stringify),
+# and derives table definitions and Markdown tables from DDL (sql_parse, sql_to_markdown).
+
+# ---------------------------------------------------------------------------
+# Lexer
+# ---------------------------------------------------------------------------
+
+def _sql_is_ident_start(c):
+  is_regex_match(c, "^[\\p{L}_@#]$")
+end
+
+def _sql_is_ident_char(c):
+  is_regex_match(c, "^[\\p{L}\\p{N}_$@#]$")
+end
+
+def _sql_is_digit(c):
+  is_regex_match(c, "^[0-9]$")
+end
+
+def _sql_sub(s, pos, k):
+  slice(s, pos, min(pos + k, len(s)))
+end
+
+# Scans a quoted token starting at pos. A doubled close char is an escaped close char.
+# Returns [position after the closing quote, content].
+def _sql_scan_quoted(s, pos, close):
+  var i = pos + 1
+  | var buf = ""
+  | var done = false
+  | let n = len(s)
+  | let _ = while (i < n && !done):
+      if (s[i] == close):
+        if (i + 1 < n && s[i + 1] == close):
+          do buf = buf + close | i += 2 | buf end
+        else:
+          do done = true | i += 1 | buf end
+      else:
+        do buf = buf + s[i] | i += 1 | buf end
+    end
+  | if (!done):
+      error("sql: unterminated quoted token at offset " + to_string(pos))
+    else:
+      [i, buf]
+end
+
+# Returns the end position of the number starting at pos.
+def _sql_scan_number(s, pos):
+  var i = pos
+  | let n = len(s)
+  | if (s[pos] == "0" && pos + 1 < n && (s[pos + 1] == "x" || s[pos + 1] == "X")):
+      do
+        i = pos + 2
+        | let _ = while (i < n && is_regex_match(s[i], "^[0-9a-fA-F]$")): i += 1 end
+        | i
+      end
+    elif (s[pos] == "0" && pos + 2 < n && (s[pos + 1] == "b" || s[pos + 1] == "B") && (s[pos + 2] == "0" || s[pos + 2] == "1")):
+      do
+        i = pos + 2
+        | let _ = while (i < n && (s[i] == "0" || s[i] == "1")): i += 1 end
+        | i
+      end
+    else:
+      do
+        let _ = while (i < n && (_sql_is_digit(s[i]) || s[i] == ".")): i += 1 end
+        | if (i < n && (s[i] == "e" || s[i] == "E")):
+            do
+              let j = if (i + 1 < n && (s[i + 1] == "+" || s[i + 1] == "-")): i + 2 else: i + 1
+              | if (j < n && _sql_is_digit(s[j])):
+                  do
+                    i = j
+                    | let _ = while (i < n && _sql_is_digit(s[i])): i += 1 end
+                    | i
+                  end
+            end
+        | i
+      end
+  | i
+end
+
+# Scans an E'...' string: backslash escapes are decoded. Returns [position after the closing quote, content].
+def _sql_scan_escaped(s, pos):
+  var i = pos + 1
+  | var buf = ""
+  | var done = false
+  | let n = len(s)
+  | let _ = while (i < n && !done):
+      if (s[i] == "\\" && i + 1 < n):
+        do
+          let e = s[i + 1]
+          | buf = buf + (if (e == "n"): "\n" elif (e == "t"): "\t" elif (e == "r"): "\r" elif (e == "b"): implode([8]) elif (e == "f"): implode([12]) else: e)
+          | i += 2
+          | buf
+        end
+      elif (s[i] == "'"):
+        if (i + 1 < n && s[i + 1] == "'"):
+          do buf = buf + "'" | i += 2 | buf end
+        else:
+          do done = true | i += 1 | buf end
+      else:
+        do buf = buf + s[i] | i += 1 | buf end
+    end
+  | if (!done): error("sql: unterminated quoted token at offset " + to_string(pos)) else: [i, buf]
+end
+
+def _sql_lex(s):
+  var pos = 0
+  | var tokens = []
+  | let n = len(s)
+  | let ops3 = ["->>", "<=>", "!~*", "#>>"]
+  | let ops2 = ["<=", ">=", "<>", "!=", "||", "->", "=>", "<<", ">>", "@>", "<@", "&&", "~*", "!~", "#>", ":=", "::"]
+  | let _ = while (pos < n):
+      let c = s[pos]
+      | let prev = if (len(tokens) > 0): tokens[len(tokens) - 1] else: None
+      | let is_sub = !is_none(prev) && prev["e"] == pos
+         && (prev["t"] == "word" || prev["t"] == "qid" || prev["t"] == ")" || (prev["t"] == "op" && prev["v"] == "]"))
+      | if (c == " " || c == "\t" || c == "\n" || c == "\r"):
+          do pos += 1 | tokens end
+        elif (c == "#" && (pos + 1 >= n || s[pos + 1] == " " || s[pos + 1] == "\t")):
+          do
+            let _ = while (pos < n && s[pos] != "\n"): pos += 1 end
+            | tokens
+          end
+        elif (c == "-" && pos + 1 < n && s[pos + 1] == "-"):
+          do
+            let _ = while (pos < n && s[pos] != "\n"): pos += 1 end
+            | tokens
+          end
+        elif (c == "/" && pos + 1 < n && s[pos + 1] == "*"):
+          do
+            pos += 2
+            | let _ = while (pos + 1 < n && not(s[pos] == "*" && s[pos + 1] == "/")):
+                          pos += 1
+                        end
+            | pos += 2
+            | tokens
+          end
+        elif (c == "'"):
+          do
+            let r = _sql_scan_quoted(s, pos, "'")
+            | tokens += [{"t": "str", "v": r[1], "s": pos, "e": r[0]}]
+            | pos = r[0]
+            | tokens
+          end
+        elif (c == "\""):
+          do
+            let r = _sql_scan_quoted(s, pos, "\"")
+            | tokens += [{"t": "qid", "q": "\"", "v": r[1], "s": pos, "e": r[0]}]
+            | pos = r[0]
+            | tokens
+          end
+        elif (c == "`"):
+          do
+            let r = _sql_scan_quoted(s, pos, "`")
+            | tokens += [{"t": "qid", "q": "`", "v": r[1], "s": pos, "e": r[0]}]
+            | pos = r[0]
+            | tokens
+          end
+        elif (c == "[" && pos + 1 < n && s[pos + 1] != "]" && !_sql_is_digit(s[pos + 1]) && s[pos + 1] != "'"
+ && !is_sub && !(!is_none(prev) && prev["t"] == "word" && prev["l"] == "array")):
+          do
+            let r = _sql_scan_quoted(s, pos, "]")
+            | tokens += [{"t": "qid", "q": "[", "v": r[1], "s": pos, "e": r[0]}]
+            | pos = r[0]
+            | tokens
+          end
+        elif (c == "$" && pos + 1 < n && (s[pos + 1] == "$" || is_regex_match(s[pos + 1], "^[A-Za-z_]$"))):
+          do
+            var i = pos + 1
+            | let _ = while (i < n && is_regex_match(s[i], "^[A-Za-z0-9_]$")): i += 1 end
+            | if (i < n && s[i] == "$"):
+                do
+                  let tag = slice(s, pos, i + 1)
+                  | let close = index(slice(s, i + 1, n), tag)
+                  | if (close < 0):
+                      error("sql: unterminated dollar-quoted string at offset " + to_string(pos))
+                    else:
+                      do
+                        tokens += [{"t": "str", "v": slice(s, i + 1, i + 1 + close), "s": pos, "e": i + 1 + close + len(tag)}]
+                        | pos = i + 1 + close + len(tag)
+                        | tokens
+                      end
+                end
+              else:
+                do tokens += [{"t": "op", "v": "$", "s": pos, "e": pos + 1}] | pos += 1 | tokens end
+          end
+        elif (c == "$" && pos + 1 < n && _sql_is_digit(s[pos + 1])):
+          do
+            let start = pos
+            | pos += 1
+            | let _ = while (pos < n && _sql_is_digit(s[pos])): pos += 1 end
+            | tokens += [{"t": "param", "v": slice(s, start, pos), "s": start, "e": pos}]
+            | tokens
+          end
+        elif (c == "?"):
+          do tokens += [{"t": "param", "v": "?", "s": pos, "e": pos + 1}] | pos += 1 | tokens end
+        elif (c == "." && pos + 1 < n && _sql_is_digit(s[pos + 1])):
+          do
+            let e = _sql_scan_number(s, pos)
+            | tokens += [{"t": "num", "v": slice(s, pos, e), "s": pos, "e": e}]
+            | pos = e
+            | tokens
+          end
+        elif (c == "(" || c == ")" || c == "," || c == ";" || c == "."):
+          do tokens += [{"t": c, "v": c, "s": pos, "e": pos + 1}] | pos += 1 | tokens end
+        elif (_sql_is_digit(c)):
+          do
+            let e = _sql_scan_number(s, pos)
+            | tokens += [{"t": "num", "v": slice(s, pos, e), "s": pos, "e": e}]
+            | pos = e
+            | tokens
+          end
+        elif (contains(["E", "e", "N", "n", "X", "x", "B", "b"], c) && pos + 1 < n && s[pos + 1] == "'"):
+          do
+            let up = upcase(c)
+            | let r = if (up == "E"): _sql_scan_escaped(s, pos + 1) else: _sql_scan_quoted(s, pos + 1, "'")
+            | tokens += [{"t": "str", "v": r[1], "prefix": (if (up == "E"): None else: up), "s": pos, "e": r[0]}]
+            | pos = r[0]
+            | tokens
+          end
+        elif (contains(ops3, _sql_sub(s, pos, 3))):
+          do tokens += [{"t": "op", "v": _sql_sub(s, pos, 3), "s": pos, "e": pos + 3}] | pos += 3 | tokens end
+        elif (contains(ops2, _sql_sub(s, pos, 2))):
+          do tokens += [{"t": "op", "v": _sql_sub(s, pos, 2), "s": pos, "e": pos + 2}] | pos += 2 | tokens end
+        elif (_sql_is_ident_start(c)):
+          do
+            let start = pos
+            | let _ = while (pos < n && _sql_is_ident_char(s[pos])): pos += 1 end
+            | let w = slice(s, start, pos)
+            | tokens += [{"t": "word", "v": w, "l": downcase(w), "s": start, "e": pos}]
+            | tokens
+          end
+        elif (c == ":" && pos + 1 < n && _sql_is_ident_start(s[pos + 1])):
+          do
+            let start = pos
+            | pos += 1
+            | let _ = while (pos < n && _sql_is_ident_char(s[pos])): pos += 1 end
+            | tokens += [{"t": "param", "v": slice(s, start, pos), "s": start, "e": pos}]
+            | tokens
+          end
+        else:
+          do tokens += [{"t": "op", "v": c, "s": pos, "e": pos + 1}] | pos += 1 | tokens end
+    end
+  | tokens
+end
+
+# ---------------------------------------------------------------------------
+# Token helpers
+# ---------------------------------------------------------------------------
+
+# Quote style of a name token (", ` or [), or false for a bare word.
+def _sql_qflag(tok):
+  if (tok["t"] == "qid"): tok["q"] elif (tok["t"] == "str"): "\"" else: false
+end
+
+def _sql_tt(toks, i):
+  if (i < 0 || i >= len(toks)): "eof" else: toks[i]["t"]
+end
+
+# Lowercased keyword at i, or "" when the token is not a bare word.
+def _sql_kw(toks, i):
+  if (i >= 0 && i < len(toks) && toks[i]["t"] == "word"): toks[i]["l"] else: ""
+end
+
+def _sql_is_op(toks, i, v):
+  _sql_tt(toks, i) == "op" && toks[i]["v"] == v
+end
+
+def _sql_is_name_tok(toks, i):
+  let t = _sql_tt(toks, i)
+  | t == "word" || t == "qid"
+end
+
+def _sql_err(toks, i, msg):
+  let loc = if (i >= 0 && i < len(toks)): "near '" + to_string(toks[i]["v"]) + "' (offset " + to_string(toks[i]["s"]) + ")" else: "at end of input"
+  | error("sql: " + msg + " " + loc)
+end
+
+def _sql_accept(toks, i, kw):
+  if (_sql_kw(toks, i) == kw): i + 1 else: i
+end
+
+def _sql_expect(toks, i, kw):
+  if (_sql_kw(toks, i) == kw): i + 1 else: _sql_err(toks, i, "expected " + upcase(kw))
+end
+
+def _sql_expect_t(toks, i, t):
+  if (_sql_tt(toks, i) == t): i + 1 else: _sql_err(toks, i, "expected '" + t + "'")
+end
+
+def _sql_expect_op(toks, i, v):
+  if (_sql_is_op(toks, i, v)): i + 1 else: _sql_err(toks, i, "expected '" + v + "'")
+end
+
+def _sql_tok_text(tok):
+  let t = tok["t"]
+  | if (t == "str"): "'" + replace(tok["v"], "'", "''") + "'"
+    elif (t == "qid"): "\"" + replace(tok["v"], "\"", "\"\"") + "\""
+    else: tok["v"]
+end
+
+# Joins tokens into text with SQL-style spacing.
+def _sql_join_tokens(toks):
+  var out = ""
+  | var prev = None
+  | let _ = fold(toks, 0, ->(acc, t):
+      let tt = t["t"]
+      | let glue = is_none(prev) || prev["t"] == "(" || prev["t"] == "." || tt == ")" || tt == "," || tt == "(" || tt == "."
+         || (tt == "op" && t["v"] == "::") || (prev["t"] == "op" && prev["v"] == "::")
+         || (tt == "op" && (t["v"] == "[" || t["v"] == "]"))
+      | out = out + (if (glue): "" else: " ") + _sql_tok_text(t)
+      | prev = t
+      | acc;)
+  | out
+end
+
+# Index of the ")" matching the "(" at i.
+def _sql_match_paren(toks, i):
+  var depth = 0
+  | var j = i
+  | var found = -1
+  | let n = len(toks)
+  | let _ = while (j < n && found < 0):
+      let t = toks[j]["t"]
+      | if (t == "("):
+          do depth += 1 | j += 1 | j end
+        elif (t == ")"):
+          do
+            depth -= 1
+            | if (depth == 0): found = j
+            | j += 1
+            | j
+          end
+        else:
+          do j += 1 | j end
+    end
+  | if (found < 0): _sql_err(toks, i, "unbalanced parentheses") else: found
+end
+
+# Index of the first unmatched ")" at or after i, or len(toks).
+def _sql_find_close(toks, i):
+  var depth = 0
+  | var j = i
+  | var found = -1
+  | let n = len(toks)
+  | let _ = while (j < n && found < 0):
+      let t = toks[j]["t"]
+      | if (t == "("):
+          do depth += 1 | j += 1 | j end
+        elif (t == ")" && depth == 0):
+          do found = j | j end
+        elif (t == ")"):
+          do depth -= 1 | j += 1 | j end
+        else:
+          do j += 1 | j end
+    end
+  | if (found < 0): n else: found
+end
+
+# Splits tokens on commas outside parentheses.
+def _sql_split_commas(toks):
+  var parts = []
+  | var cur = []
+  | var depth = 0
+  | let _ = fold(toks, 0, ->(acc, t):
+      if (t["t"] == "("):
+        do depth += 1 | cur += [t] | acc end
+      elif (t["t"] == ")"):
+        do depth -= 1 | cur += [t] | acc end
+      elif (t["t"] == "," && depth == 0):
+        do parts += [cur] | cur = [] | acc end
+      else:
+        do cur += [t] | acc end;)
+  | if (len(cur) > 0): parts + [cur] else: parts
+end
+
+def _sql_split_statements(toks):
+  var stmts = []
+  | var cur = []
+  | var depth = 0
+  | let _ = fold(toks, 0, ->(acc, t):
+      if (t["t"] == "("):
+        do depth += 1 | cur += [t] | acc end
+      elif (t["t"] == ")"):
+        do depth -= 1 | cur += [t] | acc end
+      elif (t["t"] == ";" && depth <= 0):
+        do stmts += [cur] | cur = [] | depth = 0 | acc end
+      else:
+        do cur += [t] | acc end;)
+  | filter(if (len(cur) > 0): stmts + [cur] else: stmts, ->(s): len(s) > 0;)
+end
+
+# Parses a dotted name at i. Returns [next index, parts, quoted flags].
+def _sql_parse_name(toks, i):
+  var j = i
+  | var parts = []
+  | var flags = []
+  | var more = true
+  | let _ = while (more):
+      if (_sql_is_name_tok(toks, j)):
+        do
+          parts += [toks[j]["v"]]
+          | flags += [_sql_qflag(toks[j])]
+          | j += 1
+          | if (_sql_tt(toks, j) == "." && _sql_is_name_tok(toks, j + 1)): j += 1 else: more = false
+          | j
+        end
+      else:
+        do more = false | j end
+    end
+  | if (is_empty(parts)): _sql_err(toks, i, "expected a name") else: [j, parts, flags]
+end
+
+# Reads "(a, b(10) DESC, ...)" at i. Returns [index after ")", first name of each segment, quoted flags].
+def _sql_paren_names(toks, i):
+  let close = _sql_match_paren(toks, i)
+  | let inner = slice(toks, i + 1, close)
+  | let segs = filter(_sql_split_commas(inner), ->(seg): len(seg) > 0;)
+  | [close + 1, map(segs, ->(seg): seg[0]["v"];), map(segs, ->(seg): _sql_qflag(seg[0]);)]
+end
+
+def _sql_find_paren(toks, i):
+  var j = i
+  | let _ = while (j < len(toks) && toks[j]["t"] != "("): j += 1 end
+  | j
+end
+
+def _sql_find_kw(toks, i, kw):
+  var j = i
+  | let _ = while (j < len(toks) && _sql_kw(toks, j) != kw): j += 1 end
+  | j
+end
+
+def _sql_is_reserved(w):
+  contains(
+    ["select", "from", "where", "group", "order", "by", "having", "limit", "offset", "union", "intersect",
+      "except", "join", "inner", "left", "right", "full", "cross", "natural", "on", "using", "window",
+      "returning", "set", "values", "fetch", "for", "into", "and", "or", "not", "when", "then", "else",
+      "end", "as", "is", "in", "between", "like", "ilike", "case", "exists", "null", "true", "false",
+      "distinct", "all", "with", "table", "create", "insert", "update", "delete", "drop", "alter",
+      "lateral", "primary", "foreign", "references", "check", "default", "unique", "constraint", "over",
+      "filter", "partition", "asc", "desc", "nulls", "only", "conflict", "do", "nothing", "outer", "escape",
+      "tablesample", "straight_join", "apply", "lock", "within"],
+    w)
+end
+
+def _sql_is_query_start(toks, i):
+  let k = _sql_kw(toks, i)
+  | k == "select" || k == "with" || k == "values" || (_sql_tt(toks, i) == "(" && _sql_is_query_start(toks, i + 1))
+end
+
+# Alias at pos, with or without AS. Returns [next index, alias or None, quoted].
+def _sql_alias_at(toks, pos):
+  if (_sql_kw(toks, pos) == "as"):
+    if (_sql_is_name_tok(toks, pos + 1) || _sql_tt(toks, pos + 1) == "str"): [pos + 2, toks[pos + 1]["v"], _sql_qflag(toks[pos + 1])]
+    else: _sql_err(toks, pos + 1, "expected an alias")
+  elif (_sql_tt(toks, pos) == "qid" || (_sql_tt(toks, pos) == "word" && !_sql_is_reserved(toks[pos]["l"]))):
+    [pos + 1, toks[pos]["v"], _sql_qflag(toks[pos])]
+  else:
+    [pos, None, false]
+end
+
+# ---------------------------------------------------------------------------
+# Expressions
+# ---------------------------------------------------------------------------
+
+def _sql_lit(kind, value):
+  {"type": "literal", "kind": kind, "value": value}
+end
+
+# Parses a data type (e.g. "DECIMAL(10, 2)", "timestamp with time zone", "int[]"). Returns [next index, text].
+def _sql_parse_type(toks, pos):
+  let nm = _sql_parse_name(toks, pos)
+  | var j = nm[0]
+  | var more = true
+  | let _ = while (more):
+      let k = _sql_kw(toks, j)
+      | if (k == "varying" || k == "precision" || k == "unsigned" || k == "signed" || k == "zerofill"):
+          do j += 1 | j end
+        elif ((k == "with" || k == "without") && _sql_kw(toks, j + 1) == "time"):
+          do j += 3 | j end
+        elif (_sql_tt(toks, j) == "("):
+          do j = _sql_match_paren(toks, j) + 1 | j end
+        elif (_sql_is_op(toks, j, "[") && _sql_is_op(toks, j + 1, "]")):
+          do j += 2 | j end
+        else:
+          do more = false | j end
+    end
+  | [j, _sql_join_tokens(slice(toks, pos, j))]
+end
+
+# Infix operator info at i: [binding power, kind, operator text, tokens consumed] or None.
+def _sql_infix_info(toks, i):
+  let t = _sql_tt(toks, i)
+  | let k = _sql_kw(toks, i)
+  | let v = if (t == "op"): toks[i]["v"] else: ""
+  | let nk = _sql_kw(toks, i + 1)
+  | if (k == "or"): [1, "bin", "OR", 1]
+    elif (k == "and"): [2, "bin", "AND", 1]
+    elif (t == "op" && contains(["=", "<", ">", "<=", ">=", "<>", "!=", "<=>"], v)): [4, "bin", v, 1]
+    elif (k == "is"): [4, "is", "IS", 1]
+    elif (k == "between"): [4, "between", "BETWEEN", 1]
+    elif (k == "in"): [4, "in", "IN", 1]
+    elif (k == "like" || k == "ilike"): [4, "like", upcase(k), 1]
+    elif (k == "similar" && nk == "to"): [4, "like", "SIMILAR TO", 2]
+    elif (k == "not" && nk == "between"): [4, "between", "NOT BETWEEN", 2]
+    elif (k == "not" && nk == "in"): [4, "in", "NOT IN", 2]
+    elif (k == "not" && (nk == "like" || nk == "ilike")): [4, "like", "NOT " + upcase(nk), 2]
+    elif (t == "op" && contains(["||", "->", "->>", "#>", "#>>", "@>", "<@", "&&", "~", "~*", "!~", "!~*", "<<", ">>"], v)): [5, "bin", v, 1]
+    elif (t == "op" && (v == "+" || v == "-")): [6, "bin", v, 1]
+    elif (t == "op" && (v == "*" || v == "/" || v == "%")): [7, "bin", v, 1]
+    elif (t == "op" && v == "^"): [8, "bin", v, 1]
+    elif (t == "op" && v == "::"): [10, "cast", "::", 1]
+    elif (k == "collate"): [10, "collate", "COLLATE", 1]
+    elif (k == "at" && nk == "time" && _sql_kw(toks, i + 2) == "zone"): [10, "bin", "AT TIME ZONE", 3]
+    elif (t == "op" && v == "["): [11, "subscript", "[", 1]
+    elif (t == "op" && v == ":="): [1, "bin", ":=", 1]
+    else: None
+end
+
+def _sql_parse_expr(toks, pos):
+  _sql_parse_bp(toks, pos, 0)
+end
+
+def _sql_parse_bp(toks, pos, min_bp):
+  let first_r = _sql_parse_prefix(toks, pos)
+  | var cur = first_r[0]
+  | var left = first_r[1]
+  | var go = true
+  | let _ = while (go):
+      let info = _sql_infix_info(toks, cur)
+      | if (is_none(info) || info[0] < min_bp):
+          go = false
+        else:
+          do
+            let r = _sql_parse_infix(toks, cur, left, info)
+            | cur = r[0]
+            | left = r[1]
+            | left
+          end
+    end
+  | [cur, left]
+end
+
+def _sql_parse_infix(toks, pos, left, info):
+  let bp = info[0]
+  | let kind = info[1]
+  | let op = info[2]
+  | let i = pos + info[3]
+  | if (kind == "bin"):
+      do
+        let r = _sql_parse_bp(toks, i, bp + 1)
+        | [r[0], {"type": "binary", "op": op, "left": left, "right": r[1]}]
+      end
+    elif (kind == "cast"):
+      do
+        let ty = _sql_parse_type(toks, i)
+        | [ty[0], {"type": "cast", "expr": left, "data_type": ty[1], "style": "::"}]
+      end
+    elif (kind == "collate"):
+      do
+        let nm = _sql_parse_name(toks, i)
+        | [nm[0], {"type": "collate", "expr": left, "collation": join(nm[1], "."), "collation_quoted": nm[2]}]
+      end
+    elif (kind == "subscript"):
+      do
+        let idx = _sql_parse_expr(toks, i)
+        | if (_sql_is_op(toks, idx[0], ":")):
+            do
+              let up = _sql_parse_expr(toks, idx[0] + 1)
+              | [_sql_expect_op(toks, up[0], "]"), {"type": "subscript", "expr": left, "index": idx[1], "upper": up[1]}]
+            end
+          else:
+            [_sql_expect_op(toks, idx[0], "]"), {"type": "subscript", "expr": left, "index": idx[1], "upper": None}]
+      end
+    elif (kind == "between"):
+      do
+        let lo = _sql_parse_bp(toks, i, 5)
+        | let j = _sql_expect(toks, lo[0], "and")
+        | let hi = _sql_parse_bp(toks, j, 5)
+        | [hi[0], {"type": "between", "expr": left, "low": lo[1], "high": hi[1], "negated": starts_with(op, "NOT")}]
+      end
+    elif (kind == "in"):
+      do
+        let j = _sql_expect_t(toks, i, "(")
+        | if (_sql_is_query_start(toks, j)):
+            do
+              let q = _sql_parse_query(toks, j)
+              | let e = _sql_expect_t(toks, q[0], ")")
+              | [e, {"type": "in", "expr": left, "values": [], "query": q[1], "negated": starts_with(op, "NOT")}]
+            end
+          else:
+            do
+              let lst = _sql_parse_expr_list(toks, j)
+              | let e = _sql_expect_t(toks, lst[0], ")")
+              | [e, {"type": "in", "expr": left, "values": lst[1], "query": None, "negated": starts_with(op, "NOT")}]
+            end
+      end
+    elif (kind == "like"):
+      do
+        let r = _sql_parse_bp(toks, i, 5)
+        | let node = {"type": "binary", "op": op, "left": left, "right": r[1]}
+        | if (_sql_kw(toks, r[0]) == "escape"):
+            do
+              let esc = _sql_parse_bp(toks, r[0] + 1, 5)
+              | [esc[0], set(node, "escape", esc[1])]
+            end
+          else:
+            [r[0], node]
+      end
+    else:
+      do
+        let neg = _sql_kw(toks, i) == "not"
+        | let j = if (neg): i + 1 else: i
+        | let k = _sql_kw(toks, j)
+        | if (k == "distinct" && _sql_kw(toks, j + 1) == "from"):
+            do
+              let r = _sql_parse_bp(toks, j + 2, 5)
+              | [r[0], {"type": "binary", "op": if (neg): "IS NOT DISTINCT FROM" else: "IS DISTINCT FROM", "left": left, "right": r[1]}]
+            end
+          elif (k == "null" || k == "true" || k == "false" || k == "unknown"):
+            [j + 1, {"type": "is", "expr": left, "negated": neg, "what": upcase(k)}]
+          else:
+            _sql_err(toks, j, "expected NULL, TRUE, FALSE or DISTINCT FROM after IS")
+      end
+end
+
+def _sql_parse_prefix(toks, pos):
+  if (_sql_is_op(toks, pos, "-") || _sql_is_op(toks, pos, "+")):
+    do
+      let r = _sql_parse_bp(toks, pos + 1, 9)
+      | [r[0], {"type": "unary", "op": toks[pos]["v"], "expr": r[1]}]
+    end
+  elif (_sql_kw(toks, pos) == "not"):
+    do
+      let r = _sql_parse_bp(toks, pos + 1, 3)
+      | [r[0], {"type": "unary", "op": "NOT", "expr": r[1]}]
+    end
+  else:
+    _sql_parse_primary(toks, pos)
+end
+
+def _sql_parse_expr_list(toks, pos):
+  var j = pos
+  | var items = []
+  | var more = true
+  | let _ = while (more):
+      let r = _sql_parse_expr(toks, j)
+      | items += [r[1]]
+      | j = r[0]
+      | if (_sql_tt(toks, j) == ","): j += 1 else: more = false
+    end
+  | [j, items]
+end
+
+# "(" at pos. Returns [index after ")", expressions].
+def _sql_parse_paren_exprs(toks, pos):
+  if (_sql_tt(toks, pos + 1) == ")"):
+    [pos + 2, []]
+  else:
+    do
+      let lst = _sql_parse_expr_list(toks, pos + 1)
+      | [_sql_expect_t(toks, lst[0], ")"), lst[1]]
+    end
+end
+
+def _sql_parse_order_list(toks, pos):
+  var j = pos
+  | var items = []
+  | var more = true
+  | let _ = while (more):
+      let r = _sql_parse_expr(toks, j)
+      | j = r[0]
+      | let dk = _sql_kw(toks, j)
+      | let dir = if (dk == "asc" || dk == "desc"): upcase(dk) else: None
+      | if (!is_none(dir)): j += 1
+      | let nulls = if (_sql_kw(toks, j) == "nulls" && (_sql_kw(toks, j + 1) == "first" || _sql_kw(toks, j + 1) == "last")): upcase(_sql_kw(toks, j + 1)) else: None
+      | if (!is_none(nulls)): j += 2
+      | items += [{"type": "order_item", "expr": r[1], "direction": dir, "nulls": nulls}]
+      | if (_sql_tt(toks, j) == ","): j += 1 else: more = false
+    end
+  | [j, items]
+end
+
+# After "OVER (": parses a window specification up to and including ")".
+def _sql_parse_window_spec(toks, pos):
+  var j = pos
+  | var base = None
+  | var part = []
+  | var ord = []
+  | var frame = None
+  | if (_sql_is_name_tok(toks, j) && !contains(["partition", "order", "rows", "range", "groups"], _sql_kw(toks, j))):
+      do base = toks[j]["v"] | j += 1 end
+  | if (_sql_kw(toks, j) == "partition" && _sql_kw(toks, j + 1) == "by"):
+      do
+        let r = _sql_parse_expr_list(toks, j + 2)
+        | part = r[1]
+        | j = r[0]
+      end
+  | if (_sql_kw(toks, j) == "order" && _sql_kw(toks, j + 1) == "by"):
+      do
+        let r = _sql_parse_order_list(toks, j + 2)
+        | ord = r[1]
+        | j = r[0]
+      end
+  | if (contains(["rows", "range", "groups"], _sql_kw(toks, j))):
+      do
+        let e = _sql_find_close(toks, j)
+        | frame = _sql_join_tokens(slice(toks, j, e))
+        | j = e
+      end
+  | [_sql_expect_t(toks, j, ")"), {"type": "window", "name": base, "partition_by": part, "order_by": ord, "frame": frame}]
+end
+
+# "(" at pos, name already read. Returns [next index, call node].
+def _sql_parse_call(toks, pos, name):
+  var j = pos + 1
+  | var distinct = false
+  | var args = []
+  | var seps = []
+  | var modifier = None
+  | var more = true
+  | var filt = None
+  | var over = None
+  | var agg_order = []
+  | var within = []
+  | let special = contains(["extract", "substring", "trim", "position", "overlay"], downcase(name))
+  | let bp = if (special): 5 else: 0
+  | if (_sql_kw(toks, j) == "distinct"): do distinct = true | j += 1 end
+  | if (_sql_tt(toks, j) == ")"): more = false
+  | if (more && _sql_is_query_start(toks, j)):
+      do
+        let q = _sql_parse_query(toks, j)
+        | args = [q[1]]
+        | j = q[0]
+        | more = false
+      end
+  | if (special && contains(["both", "leading", "trailing"], _sql_kw(toks, j)) && _sql_tt(toks, j + 1) != "," && _sql_tt(toks, j + 1) != ")"):
+      do modifier = upcase(_sql_kw(toks, j)) | j += 1 end
+  | let _ = while (more):
+      let r = _sql_parse_bp(toks, j, bp)
+      | args += [r[1]]
+      | j = r[0]
+      | if (_sql_tt(toks, j) == ","):
+          do seps += [","] | j += 1 end
+        elif (special && contains(["from", "for", "in"], _sql_kw(toks, j))):
+          do seps += [upcase(_sql_kw(toks, j))] | j += 1 end
+        else:
+          more = false
+    end
+  | if (_sql_kw(toks, j) == "order" && _sql_kw(toks, j + 1) == "by"):
+      do
+        let r = _sql_parse_order_list(toks, j + 2)
+        | agg_order = r[1]
+        | j = r[0]
+      end
+  | j = _sql_expect_t(toks, j, ")")
+  | if (_sql_kw(toks, j) == "within" && _sql_kw(toks, j + 1) == "group" && _sql_tt(toks, j + 2) == "(" && _sql_kw(toks, j + 3) == "order"):
+      do
+        let r = _sql_parse_order_list(toks, j + 5)
+        | within = r[1]
+        | j = _sql_expect_t(toks, r[0], ")")
+      end
+  | if (_sql_kw(toks, j) == "filter" && _sql_tt(toks, j + 1) == "("):
+      do
+        let k = _sql_expect(toks, j + 2, "where")
+        | let r = _sql_parse_expr(toks, k)
+        | filt = r[1]
+        | j = _sql_expect_t(toks, r[0], ")")
+      end
+  | if (_sql_kw(toks, j) == "over"):
+      if (_sql_tt(toks, j + 1) == "("):
+        do
+          let w = _sql_parse_window_spec(toks, j + 2)
+          | over = w[1]
+          | j = w[0]
+        end
+      elif (_sql_is_name_tok(toks, j + 1)):
+        do
+          over = {"type": "window", "name": toks[j + 1]["v"], "partition_by": [], "order_by": [], "frame": None}
+          | j += 2
+        end
+      else:
+        _sql_err(toks, j + 1, "expected a window")
+  | [j, {"type": "call", "name": name, "args": args, "distinct": distinct, "seps": seps, "modifier": modifier, "order_by": agg_order, "within_group": within, "filter": filt, "over": over}]
+end
+
+def _sql_parse_case(toks, pos):
+  var j = pos + 1
+  | var operand = None
+  | var whens = []
+  | var els = None
+  | if (_sql_kw(toks, j) != "when"):
+      do
+        let r = _sql_parse_expr(toks, j)
+        | operand = r[1]
+        | j = r[0]
+      end
+  | let _ = while (_sql_kw(toks, j) == "when"):
+      let c = _sql_parse_expr(toks, j + 1)
+      | let k = _sql_expect(toks, c[0], "then")
+      | let r = _sql_parse_expr(toks, k)
+      | whens += [{"type": "when", "condition": c[1], "result": r[1]}]
+      | j = r[0]
+    end
+  | if (_sql_kw(toks, j) == "else"):
+      do
+        let r = _sql_parse_expr(toks, j + 1)
+        | els = r[1]
+        | j = r[0]
+      end
+  | [_sql_expect(toks, j, "end"), {"type": "case", "operand": operand, "whens": whens, "else": els}]
+end
+
+# Identifier, qualified star, or function call.
+def _sql_parse_ref(toks, pos):
+  var j = pos
+  | var parts = []
+  | var pq = []
+  | var star = false
+  | var more = true
+  | let _ = while (more):
+      if (_sql_is_name_tok(toks, j)):
+        do
+          parts += [toks[j]["v"]]
+          | pq += [_sql_qflag(toks[j])]
+          | j += 1
+          | if (_sql_tt(toks, j) == "."):
+              if (_sql_is_op(toks, j + 1, "*")):
+                do star = true | more = false | j += 2 | j end
+              else:
+                j += 1
+            else:
+              more = false
+        end
+      else:
+        do more = false | j end
+    end
+  | if (star):
+      [j, {"type": "star", "table": join(parts, "."), "table_quoted": pq}]
+    elif (_sql_tt(toks, j) == "("):
+      _sql_parse_call(toks, j, join(parts, "."))
+    else:
+      [j, {"type": "ident", "parts": parts, "parts_quoted": pq}]
+end
+
+# String literal; adjacent plain literals are concatenated.
+def _sql_parse_string(toks, pos):
+  var j = pos + 1
+  | var v = toks[pos]["v"]
+  | let prefix = get(toks[pos], "prefix")
+  | let _ = while (is_none(prefix) && _sql_tt(toks, j) == "str" && is_none(get(toks[j], "prefix"))):
+      do v = v + toks[j]["v"] | j += 1 end
+    end
+  | let lit = _sql_lit("string", v)
+  | [j, if (is_none(prefix)): lit else: set(lit, "prefix", prefix)]
+end
+
+# "[" at pos. Returns [index after "]", array node].
+def _sql_parse_array(toks, pos):
+  if (_sql_is_op(toks, pos + 1, "]")):
+    [pos + 2, {"type": "array", "items": []}]
+  else:
+    do
+      let lst = _sql_parse_expr_list(toks, pos + 1)
+      | [_sql_expect_op(toks, lst[0], "]"), {"type": "array", "items": lst[1]}]
+    end
+end
+
+def _sql_parse_primary(toks, pos):
+  let t = _sql_tt(toks, pos)
+  | let k = _sql_kw(toks, pos)
+  | if (t == "eof"):
+      _sql_err(toks, pos, "unexpected end of input in expression")
+    elif (t == "num"):
+      [pos + 1, _sql_lit("number", toks[pos]["v"])]
+    elif (t == "str"):
+      _sql_parse_string(toks, pos)
+    elif (t == "param"):
+      [pos + 1, {"type": "param", "value": toks[pos]["v"]}]
+    elif (_sql_is_op(toks, pos, "*")):
+      [pos + 1, {"type": "star", "table": None}]
+    elif (t == "("):
+      if (_sql_is_query_start(toks, pos + 1)):
+        do
+          let q = _sql_parse_query(toks, pos + 1)
+          | [_sql_expect_t(toks, q[0], ")"), {"type": "subquery", "query": q[1]}]
+        end
+      else:
+        do
+          let lst = _sql_parse_expr_list(toks, pos + 1)
+          | let e = _sql_expect_t(toks, lst[0], ")")
+          | if (len(lst[1]) == 1): [e, set(first(lst[1]), "paren", true)] else: [e, {"type": "tuple", "items": lst[1]}]
+        end
+    elif (k == "null"):
+      [pos + 1, _sql_lit("null", None)]
+    elif (k == "true"):
+      [pos + 1, _sql_lit("boolean", true)]
+    elif (k == "false"):
+      [pos + 1, _sql_lit("boolean", false)]
+    elif (k == "default"):
+      [pos + 1, _sql_lit("default", None)]
+    elif (k == "case"):
+      _sql_parse_case(toks, pos)
+    elif (k == "array" && _sql_is_op(toks, pos + 1, "[")):
+      _sql_parse_array(toks, pos + 1)
+    elif (_sql_is_op(toks, pos, "[")):
+      _sql_parse_array(toks, pos)
+    elif (contains(["any", "some", "all"], k) && _sql_tt(toks, pos + 1) == "("):
+      if (_sql_is_query_start(toks, pos + 2)):
+        do
+          let q = _sql_parse_query(toks, pos + 2)
+          | [_sql_expect_t(toks, q[0], ")"), {"type": "quantified", "quantifier": upcase(k), "query": q[1], "expr": None}]
+        end
+      else:
+        do
+          let e = _sql_parse_expr(toks, pos + 2)
+          | [_sql_expect_t(toks, e[0], ")"), {"type": "quantified", "quantifier": upcase(k), "query": None, "expr": e[1]}]
+        end
+    elif (k == "grouping" && _sql_kw(toks, pos + 1) == "sets" && _sql_tt(toks, pos + 2) == "("):
+      _sql_parse_call(toks, pos + 2, "GROUPING SETS")
+    elif (k == "cast" && _sql_tt(toks, pos + 1) == "("):
+      do
+        let e = _sql_parse_expr(toks, pos + 2)
+        | let j = _sql_expect(toks, e[0], "as")
+        | let ty = _sql_parse_type(toks, j)
+        | [_sql_expect_t(toks, ty[0], ")"), {"type": "cast", "expr": e[1], "data_type": ty[1], "style": "cast"}]
+      end
+    elif (k == "exists" && _sql_tt(toks, pos + 1) == "("):
+      do
+        let q = _sql_parse_query(toks, pos + 2)
+        | [_sql_expect_t(toks, q[0], ")"), {"type": "exists", "query": q[1]}]
+      end
+    elif (contains(["date", "time", "timestamp", "interval"], k) && _sql_tt(toks, pos + 1) == "str"):
+      do
+        let uk = _sql_kw(toks, pos + 2)
+        | let has_unit = k == "interval" && contains(["year", "month", "day", "hour", "minute", "second"], uk)
+        | [pos + (if (has_unit): 3 else: 2),
+          {"type": "typed_literal", "data_type": upcase(k), "value": toks[pos + 1]["v"], "unit": if (has_unit): upcase(uk) else: None}]
+      end
+    elif (t == "word" && _sql_tt(toks, pos + 1) != "(" && contains(["select", "from", "where", "group", "order", "by", "having", "limit", "offset", "union", "intersect", "except", "join", "inner", "cross", "natural", "on", "using", "returning", "set", "values", "into", "and", "or", "when", "then", "else", "end", "as", "is", "in", "between", "like", "with", "create", "insert", "update", "delete", "drop", "alter"], k)):
+      _sql_err(toks, pos, "unexpected keyword in expression")
+    elif (t == "word" || t == "qid"):
+      _sql_parse_ref(toks, pos)
+    else:
+      _sql_err(toks, pos, "unexpected token in expression")
+end
+
+# ---------------------------------------------------------------------------
+# Queries
+# ---------------------------------------------------------------------------
+
+def _sql_parse_select_items(toks, pos):
+  var j = pos
+  | var items = []
+  | var more = true
+  | let _ = while (more):
+      let r = _sql_parse_expr(toks, j)
+      | let a = _sql_alias_at(toks, r[0])
+      | items += [{"type": "select_item", "expr": r[1], "alias": a[1], "alias_quoted": a[2]}]
+      | j = a[0]
+      | if (_sql_tt(toks, j) == ","): j += 1 else: more = false
+    end
+  | [j, items]
+end
+
+def _sql_join_info(toks, i):
+  var j = i
+  | var natural = false
+  | var kind = "INNER"
+  | var done = false
+  | var inner_kw = false
+  | var outer_kw = false
+  | if (_sql_kw(toks, j) == "natural"): do natural = true | j += 1 end
+  | let k = _sql_kw(toks, j)
+  | if (k == "straight_join"):
+      do kind = "STRAIGHT_JOIN" | done = true | j += 1 end
+    elif ((k == "cross" || k == "outer") && _sql_kw(toks, j + 1) == "apply"):
+      do kind = upcase(k) + " APPLY" | done = true | j += 2 end
+    elif (k == "inner"):
+      do inner_kw = true | j += 1 end
+    elif (k == "left" || k == "right" || k == "full"):
+      do
+        kind = upcase(k)
+        | j += 1
+        | if (_sql_kw(toks, j) == "outer"): do outer_kw = true | j += 1 end
+      end
+    elif (k == "cross"):
+      do kind = "CROSS" | j += 1 end
+  | if (done): [j, kind, natural, false, false] elif (_sql_kw(toks, j) == "join"): [j + 1, kind, natural, inner_kw, outer_kw] else: None
+end
+
+def _sql_parse_table_primary(toks, pos):
+  let lat = _sql_kw(toks, pos) == "lateral"
+  | let j0 = if (lat): pos + 1 else: pos
+  | if (_sql_tt(toks, j0) == "("):
+      if (_sql_is_query_start(toks, j0 + 1)):
+        do
+          let q = _sql_parse_query(toks, j0 + 1)
+          | let j = _sql_expect_t(toks, q[0], ")")
+          | let a = _sql_alias_at(toks, j)
+          | let cols = if (!is_none(a[1]) && _sql_tt(toks, a[0]) == "("): _sql_paren_names(toks, a[0]) else: [a[0], [], []]
+          | [cols[0], {"type": "subquery", "query": q[1], "alias": a[1], "alias_quoted": a[2], "columns": cols[1], "columns_quoted": cols[2], "lateral": lat}]
+        end
+      else:
+        do
+          let inner = _sql_parse_table_expr(toks, j0 + 1)
+          | [_sql_expect_t(toks, inner[0], ")"), inner[1]]
+        end
+    else:
+      do
+        let only = _sql_kw(toks, j0) == "only" && _sql_is_name_tok(toks, j0 + 1)
+        | let nm = _sql_parse_name(toks, if (only): j0 + 1 else: j0)
+        | if (_sql_tt(toks, nm[0]) == "("):
+            do
+              let args = _sql_parse_paren_exprs(toks, nm[0])
+              | let a = _sql_alias_at(toks, args[0])
+              | let cols = if (!is_none(a[1]) && _sql_tt(toks, a[0]) == "("): _sql_paren_names(toks, a[0]) else: [a[0], [], []]
+              | [cols[0], {"type": "table_function", "name": join(nm[1], "."), "name_quoted": nm[2], "args": args[1], "alias": a[1], "alias_quoted": a[2],
+                "columns": cols[1], "columns_quoted": cols[2], "lateral": lat}]
+            end
+          else:
+            do
+              let a = _sql_alias_at(toks, nm[0])
+              | var j2 = a[0]
+              | var sample = None
+              | var hints = None
+              | if (_sql_kw(toks, j2) == "tablesample" && _sql_is_name_tok(toks, j2 + 1) && _sql_tt(toks, j2 + 2) == "("):
+                  do
+                    let args = _sql_parse_paren_exprs(toks, j2 + 2)
+                    | j2 = args[0]
+                    | var rep_e = None
+                    | if (_sql_kw(toks, j2) == "repeatable" && _sql_tt(toks, j2 + 1) == "("):
+                        do
+                          let r = _sql_parse_paren_exprs(toks, j2 + 1)
+                          | rep_e = first(r[1])
+                          | j2 = r[0]
+                        end
+                    | sample = {"type": "tablesample", "method": upcase(toks[a[0] + 1]["v"]), "args": args[1], "repeatable": rep_e}
+                  end
+              | if (_sql_kw(toks, j2) == "with" && _sql_tt(toks, j2 + 1) == "("):
+                  do
+                    let close = _sql_match_paren(toks, j2 + 1)
+                    | hints = _sql_join_tokens(slice(toks, j2 + 2, close))
+                    | j2 = close + 1
+                  end
+              | [j2, {"type": "table", "only": only, "name": join(nm[1], "."), "name_quoted": nm[2], "alias": a[1], "alias_quoted": a[2], "tablesample": sample, "hints": hints}]
+            end
+      end
+end
+
+def _sql_parse_table_expr(toks, pos):
+  let p = _sql_parse_table_primary(toks, pos)
+  | var j = p[0]
+  | var left = p[1]
+  | var go = true
+  | let _ = while (go):
+      let info = _sql_join_info(toks, j)
+      | if (is_none(info)):
+          go = false
+        else:
+          do
+            let right = _sql_parse_table_primary(toks, info[0])
+            | var on_e = None
+            | var using_cols = []
+            | var using_q = []
+            | var k = right[0]
+            | if (_sql_kw(toks, k) == "on"):
+                do
+                  let e = _sql_parse_expr(toks, k + 1)
+                  | on_e = e[1]
+                  | k = e[0]
+                end
+              elif (_sql_kw(toks, k) == "using" && _sql_tt(toks, k + 1) == "("):
+                do
+                  let u = _sql_paren_names(toks, k + 1)
+                  | using_cols = u[1]
+                  | using_q = u[2]
+                  | k = u[0]
+                end
+            | left = {"type": "join", "kind": info[1], "natural": info[2], "inner": info[3], "outer": info[4], "left": left, "right": right[1], "on": on_e, "using": using_cols, "using_quoted": using_q}
+            | j = k
+            | left
+          end
+    end
+  | [j, left]
+end
+
+def _sql_parse_from_list(toks, pos):
+  var j = pos
+  | var items = []
+  | var more = true
+  | let _ = while (more):
+      let r = _sql_parse_table_expr(toks, j)
+      | items += [r[1]]
+      | j = r[0]
+      | if (_sql_tt(toks, j) == ","): j += 1 else: more = false
+    end
+  | [j, items]
+end
+
+def _sql_parse_select(toks, pos):
+  var j = pos + 1
+  | var distinct = false
+  | var distinct_on = []
+  | var frm = []
+  | var whr = None
+  | var grp = []
+  | var hav = None
+  | var wins = []
+  | var top_n = None
+  | var gmod = None
+  | var sel_all = false
+  | if (_sql_kw(toks, j) == "distinct"):
+      do
+        distinct = true
+        | j += 1
+        | if (_sql_kw(toks, j) == "on" && _sql_tt(toks, j + 1) == "("):
+            do
+              let r = _sql_parse_paren_exprs(toks, j + 1)
+              | distinct_on = r[1]
+              | j = r[0]
+            end
+      end
+    elif (_sql_kw(toks, j) == "all"):
+      do sel_all = true | j += 1 end
+  | if (_sql_kw(toks, j) == "top" && (_sql_tt(toks, j + 1) == "num" || _sql_tt(toks, j + 1) == "(" || _sql_tt(toks, j + 1) == "param")):
+      do
+        let r = _sql_parse_bp(toks, j + 1, 10)
+        | let pct = _sql_kw(toks, r[0]) == "percent"
+        | let k = if (pct): r[0] + 1 else: r[0]
+        | let ties = _sql_kw(toks, k) == "with" && _sql_kw(toks, k + 1) == "ties"
+        | top_n = {"type": "top", "count": r[1], "percent": pct, "with_ties": ties}
+        | j = if (ties): k + 2 else: k
+      end
+  | let items = _sql_parse_select_items(toks, j)
+  | j = items[0]
+  | if (_sql_kw(toks, j) == "from"):
+      do
+        let r = _sql_parse_from_list(toks, j + 1)
+        | frm = r[1]
+        | j = r[0]
+      end
+  | if (_sql_kw(toks, j) == "where"):
+      do
+        let r = _sql_parse_expr(toks, j + 1)
+        | whr = r[1]
+        | j = r[0]
+      end
+  | if (_sql_kw(toks, j) == "group" && _sql_kw(toks, j + 1) == "by"):
+      do
+        let r = _sql_parse_expr_list(toks, j + 2)
+        | grp = r[1]
+        | j = r[0]
+        | if (_sql_kw(toks, j) == "with" && _sql_kw(toks, j + 1) == "rollup"): do gmod = "WITH ROLLUP" | j += 2 end
+      end
+  | if (_sql_kw(toks, j) == "having"):
+      do
+        let r = _sql_parse_expr(toks, j + 1)
+        | hav = r[1]
+        | j = r[0]
+      end
+  | if (_sql_kw(toks, j) == "window"):
+      do
+        var more_w = true
+        | var k = j + 1
+        | let _ = while (more_w):
+                  let nm = if (_sql_is_name_tok(toks, k)): toks[k]["v"] else: _sql_err(toks, k, "expected a window name")
+                  | let k1 = _sql_expect(toks, k + 1, "as")
+                  | let k2 = _sql_expect_t(toks, k1, "(")
+                  | let w = _sql_parse_window_spec(toks, k2)
+                  | wins += [{"type": "named_window", "name": nm, "spec": w[1]}]
+                  | k = w[0]
+                  | if (_sql_tt(toks, k) == ","): k += 1 else: more_w = false
+                end
+        | j = k
+      end
+  | [j, {"type": "select", "with": [], "recursive": false, "distinct": distinct, "select_all": sel_all, "distinct_on": distinct_on,
+    "top": top_n, "columns": items[1], "from": frm, "where": whr, "group_by": grp, "group_by_modifier": gmod, "having": hav, "windows": wins,
+    "order_by": [], "limit": None, "offset": None, "offset_rows": None, "fetch": None, "locking": []}]
+end
+
+def _sql_parse_values(toks, pos):
+  var j = pos + 1
+  | var rows = []
+  | var more = true
+  | let _ = while (more):
+      let r = _sql_parse_paren_exprs(toks, j)
+      | rows += [r[1]]
+      | j = r[0]
+      | if (_sql_tt(toks, j) == ","): j += 1 else: more = false
+    end
+  | [j, {"type": "values", "with": [], "recursive": false, "rows": rows, "order_by": [], "limit": None, "offset": None, "offset_rows": None, "fetch": None, "locking": []}]
+end
+
+def _sql_parse_select_core(toks, pos):
+  if (_sql_tt(toks, pos) == "("):
+    do
+      let q = _sql_parse_query(toks, pos + 1)
+      | [_sql_expect_t(toks, q[0], ")"), set(q[1], "paren", true)]
+    end
+  elif (_sql_kw(toks, pos) == "select"):
+    _sql_parse_select(toks, pos)
+  elif (_sql_kw(toks, pos) == "values"):
+    _sql_parse_values(toks, pos)
+  else:
+    _sql_err(toks, pos, "expected SELECT")
+end
+
+def _sql_parse_set_expr(toks, pos):
+  let first_r = _sql_parse_select_core(toks, pos)
+  | var j = first_r[0]
+  | var left = first_r[1]
+  | let _ = while (contains(["union", "intersect", "except"], _sql_kw(toks, j))):
+      let op = upcase(_sql_kw(toks, j))
+      | let all = _sql_kw(toks, j + 1) == "all"
+      | let k = if (all || _sql_kw(toks, j + 1) == "distinct"): j + 2 else: j + 1
+      | let right = _sql_parse_select_core(toks, k)
+      | left = {"type": "set_op", "op": op, "all": all, "left": left, "right": right[1], "with": [], "recursive": false,
+        "order_by": [], "limit": None, "offset": None, "offset_rows": None, "fetch": None, "locking": []}
+      | j = right[0]
+    end
+  | [j, left]
+end
+
+# Parses a WITH clause. Returns [next index, CTEs, recursive].
+def _sql_parse_with(toks, pos):
+  var j = pos + 1
+  | var ctes = []
+  | var recursive = false
+  | var more = true
+  | if (_sql_kw(toks, j) == "recursive"): do recursive = true | j += 1 end
+  | let _ = while (more):
+      if (!_sql_is_name_tok(toks, j)):
+        _sql_err(toks, j, "expected a CTE name")
+      else:
+        do
+          let name = toks[j]["v"]
+          | let name_q = _sql_qflag(toks[j])
+          | j += 1
+          | let cols = if (_sql_tt(toks, j) == "("): _sql_paren_names(toks, j) else: [j, [], []]
+          | j = _sql_expect(toks, cols[0], "as")
+          | var mat = None
+          | if (_sql_kw(toks, j) == "not" && _sql_kw(toks, j + 1) == "materialized"): do mat = "NOT MATERIALIZED" | j += 2 end
+          | if (_sql_kw(toks, j) == "materialized"): do mat = "MATERIALIZED" | j += 1 end
+          | j = _sql_expect_t(toks, j, "(")
+          | let q = _sql_parse_query(toks, j)
+          | j = _sql_expect_t(toks, q[0], ")")
+          | ctes += [{"type": "cte", "materialized": mat, "name": name, "name_quoted": name_q, "columns": cols[1], "columns_quoted": cols[2], "query": q[1]}]
+          | if (_sql_tt(toks, j) == ","): j += 1 else: more = false
+        end
+    end
+  | [j, ctes, recursive]
+end
+
+# Parses a query (WITH, SELECT, VALUES, set operations, ORDER BY, LIMIT, OFFSET).
+def _sql_parse_query(toks, pos):
+  var j = pos
+  | var ctes = []
+  | var recursive = false
+  | var more = true
+  | var locks = []
+  | if (_sql_kw(toks, j) == "with"):
+      do
+        let w = _sql_parse_with(toks, j)
+        | ctes = w[1]
+        | recursive = w[2]
+        | j = w[0]
+      end
+  | let body = _sql_parse_set_expr(toks, j)
+  | j = body[0]
+  | var node = set(set(body[1], "with", ctes), "recursive", recursive)
+  | if (_sql_kw(toks, j) == "order" && _sql_kw(toks, j + 1) == "by"):
+      do
+        let r = _sql_parse_order_list(toks, j + 2)
+        | node = set(node, "order_by", r[1])
+        | j = r[0]
+      end
+  | let _ = while (_sql_kw(toks, j) == "limit" || _sql_kw(toks, j) == "offset"):
+      if (_sql_kw(toks, j) == "limit"):
+        if (_sql_kw(toks, j + 1) == "all"):
+          do node = set(node, "limit", _sql_lit("all", None)) | j += 2 end
+        else:
+          do
+            let r = _sql_parse_expr(toks, j + 1)
+            | if (_sql_tt(toks, r[0]) == ","):
+                do
+                  let r2 = _sql_parse_expr(toks, r[0] + 1)
+                  | node = set(set(node, "offset", r[1]), "limit", r2[1])
+                  | j = r2[0]
+                end
+              else:
+                do
+                  node = set(node, "limit", r[1])
+                  | j = r[0]
+                end
+          end
+      else:
+        do
+          let r = _sql_parse_expr(toks, j + 1)
+          | node = set(node, "offset", r[1])
+          | j = r[0]
+          | if (_sql_kw(toks, j) == "row" || _sql_kw(toks, j) == "rows"):
+              do node = set(node, "offset_rows", upcase(_sql_kw(toks, j))) | j += 1 end
+        end
+    end
+  | if (_sql_kw(toks, j) == "fetch"):
+      do
+        let k0 = j + 2
+        | let has_count = _sql_kw(toks, k0) != "row" && _sql_kw(toks, k0) != "rows"
+        | let c = if (has_count): _sql_parse_expr(toks, k0) else: [k0, None]
+        | let k1 = c[0] + 1
+        | let ties = _sql_kw(toks, k1) == "with"
+        | node = set(node, "fetch", {"type": "fetch", "next": _sql_kw(toks, j + 1) == "next", "count": c[1], "unit": upcase(_sql_kw(toks, c[0])), "with_ties": ties})
+        | j = if (ties): k1 + 2 else: k1 + 1
+      end
+  | if (_sql_kw(toks, j) == "lock" && _sql_kw(toks, j + 1) == "in" && _sql_kw(toks, j + 2) == "share" && _sql_kw(toks, j + 3) == "mode"):
+      do
+        locks += [{"type": "locking", "strength": "LOCK IN SHARE MODE", "of": [], "wait": None}]
+        | j += 4
+      end
+  | let _ = while (_sql_kw(toks, j) == "for" && contains(["update", "share", "no", "key"], _sql_kw(toks, j + 1))):
+      do
+        let k = _sql_kw(toks, j + 1)
+        | let strength = if (k == "update"): "UPDATE" elif (k == "share"): "SHARE" elif (k == "no"): "NO KEY UPDATE" else: "KEY SHARE"
+        | var i = j + (if (k == "update" || k == "share"): 2 elif (k == "key"): 3 else: 4)
+        | var of_t = []
+        | var wait = None
+        | if (_sql_kw(toks, i) == "of"):
+            do
+              i += 1
+              | var more_t = true
+              | let _ = while (more_t):
+                              let nm = _sql_parse_name(toks, i)
+                              | of_t += [join(nm[1], ".")]
+                              | i = nm[0]
+                              | if (_sql_tt(toks, i) == ","): i += 1 else: more_t = false
+                            end
+            end
+        | if (_sql_kw(toks, i) == "nowait"):
+            do wait = "NOWAIT" | i += 1 end
+          elif (_sql_kw(toks, i) == "skip" && _sql_kw(toks, i + 1) == "locked"):
+            do wait = "SKIP LOCKED" | i += 2 end
+        | locks += [{"type": "locking", "strength": strength, "of": of_t, "wait": wait}]
+        | j = i
+      end
+    end
+  | node = set(node, "locking", locks)
+  | [j, node]
+end
+
+# ---------------------------------------------------------------------------
+# DML
+# ---------------------------------------------------------------------------
+
+def _sql_parse_assignments(toks, pos):
+  var j = pos
+  | var items = []
+  | var more = true
+  | let _ = while (more):
+      let multi = _sql_tt(toks, j) == "("
+      | let nm = if (multi): _sql_paren_names(toks, j) else: _sql_parse_name(toks, j)
+      | let k = _sql_expect_op(toks, nm[0], "=")
+      | let e = _sql_parse_expr(toks, k)
+      | items += [{"type": "assignment", "column": (if (multi): None else: join(nm[1], ".")), "column_quoted": (if (multi): [] else: nm[2]),
+        "columns": (if (multi): nm[1] else: []), "columns_quoted": (if (multi): nm[2] else: []), "value": e[1]}]
+      | j = e[0]
+      | if (_sql_tt(toks, j) == ","): j += 1 else: more = false
+    end
+  | [j, items]
+end
+
+def _sql_parse_returning(toks, pos):
+  if (_sql_kw(toks, pos) == "returning"): _sql_parse_select_items(toks, pos + 1) else: [pos, []]
+end
+
+def _sql_parse_where_opt(toks, pos):
+  if (_sql_kw(toks, pos) == "where"):
+    do
+      let r = _sql_parse_expr(toks, pos + 1)
+      | [r[0], r[1]]
+    end
+  else:
+    [pos, None]
+end
+
+# Optional ORDER BY and LIMIT after UPDATE / DELETE. Returns [next index, order items, limit].
+def _sql_parse_order_limit(toks, pos):
+  var j = pos
+  | var ord = []
+  | var lim = None
+  | if (_sql_kw(toks, j) == "order" && _sql_kw(toks, j + 1) == "by"):
+      do
+        let r = _sql_parse_order_list(toks, j + 2)
+        | ord = r[1]
+        | j = r[0]
+      end
+  | if (_sql_kw(toks, j) == "limit"):
+      do
+        let r = _sql_parse_expr(toks, j + 1)
+        | lim = r[1]
+        | j = r[0]
+      end
+  | [j, ord, lim]
+end
+
+def _sql_parse_insert(toks, pos):
+  var j = pos + 1
+  | var modifier = None
+  | var cols = []
+  | var source = None
+  | var on_conflict = None
+  | var on_dup = []
+  | var set_asg = []
+  | var cols_q = []
+  | var target_q = []
+  | if (_sql_kw(toks, j) == "or"):
+      do modifier = "OR " + upcase(_sql_kw(toks, j + 1)) | j += 2 end
+    elif (_sql_kw(toks, j) == "ignore"):
+      do modifier = "IGNORE" | j += 1 end
+  | j = _sql_expect(toks, j, "into")
+  | let nm = _sql_parse_name(toks, j)
+  | j = nm[0]
+  | if (_sql_tt(toks, j) == "(" && !_sql_is_query_start(toks, j + 1)):
+      do
+        let c = _sql_paren_names(toks, j)
+        | cols = c[1]
+        | cols_q = c[2]
+        | j = c[0]
+      end
+  | if (_sql_kw(toks, j) == "set"):
+      do
+        let a = _sql_parse_assignments(toks, j + 1)
+        | set_asg = a[1]
+        | j = a[0]
+      end
+    elif (_sql_kw(toks, j) == "default" && _sql_kw(toks, j + 1) == "values"):
+      j += 2
+    else:
+      do
+        let q = _sql_parse_query(toks, j)
+        | source = q[1]
+        | j = q[0]
+      end
+  | if (_sql_kw(toks, j) == "on" && _sql_kw(toks, j + 1) == "conflict"):
+      do
+        j += 2
+        | var target = []
+        | var cons_name = None
+        | if (_sql_tt(toks, j) == "("):
+            do
+              let c = _sql_paren_names(toks, j)
+              | target = c[1]
+              | target_q = c[2]
+              | j = c[0]
+            end
+          elif (_sql_kw(toks, j) == "on" && _sql_kw(toks, j + 1) == "constraint" && _sql_is_name_tok(toks, j + 2)):
+            do cons_name = toks[j + 2]["v"] | j += 3 end
+        | j = _sql_expect(toks, j, "do")
+        | if (_sql_kw(toks, j) == "nothing"):
+            do
+              on_conflict = {"type": "on_conflict", "target": target, "target_quoted": target_q, "constraint": cons_name, "action": "NOTHING", "set": [], "where": None}
+              | j += 1
+            end
+          else:
+            do
+              j = _sql_expect(toks, j, "update")
+              | j = _sql_expect(toks, j, "set")
+              | let a = _sql_parse_assignments(toks, j)
+              | let w = _sql_parse_where_opt(toks, a[0])
+              | on_conflict = {"type": "on_conflict", "target": target, "target_quoted": target_q, "constraint": cons_name, "action": "UPDATE", "set": a[1], "where": w[1]}
+              | j = w[0]
+            end
+      end
+    elif (_sql_kw(toks, j) == "on" && _sql_kw(toks, j + 1) == "duplicate"):
+      do
+        j = _sql_expect(toks, j + 2, "key")
+        | j = _sql_expect(toks, j, "update")
+        | let a = _sql_parse_assignments(toks, j)
+        | on_dup = a[1]
+        | j = a[0]
+      end
+  | let ret = _sql_parse_returning(toks, j)
+  | [ret[0], {"type": "insert", "modifier": modifier, "table": join(nm[1], "."), "table_quoted": nm[2], "columns": cols, "columns_quoted": cols_q, "source": source, "set": set_asg,
+    "with": [], "recursive": false, "on_conflict": on_conflict, "on_duplicate_key_update": on_dup, "returning": ret[1]}]
+end
+
+def _sql_parse_update(toks, pos):
+  var j = _sql_accept(toks, pos + 1, "only")
+  | let only = j > pos + 1
+  | var frm = []
+  | let nm = _sql_parse_name(toks, j)
+  | let a = _sql_alias_at(toks, nm[0])
+  | j = _sql_expect(toks, a[0], "set")
+  | let asg = _sql_parse_assignments(toks, j)
+  | j = asg[0]
+  | if (_sql_kw(toks, j) == "from"):
+      do
+        let r = _sql_parse_from_list(toks, j + 1)
+        | frm = r[1]
+        | j = r[0]
+      end
+  | let w = _sql_parse_where_opt(toks, j)
+  | let ol = _sql_parse_order_limit(toks, w[0])
+  | let ret = _sql_parse_returning(toks, ol[0])
+  | [ret[0], {"type": "update", "with": [], "recursive": false, "only": only, "table": join(nm[1], "."), "table_quoted": nm[2], "alias": a[1], "alias_quoted": a[2], "set": asg[1], "from": frm,
+    "where": w[1], "order_by": ol[1], "limit": ol[2], "returning": ret[1]}]
+end
+
+def _sql_parse_delete(toks, pos):
+  var j = _sql_expect(toks, pos + 1, "from")
+  | var using_l = []
+  | let only = _sql_kw(toks, j) == "only"
+  | j = _sql_accept(toks, j, "only")
+  | let nm = _sql_parse_name(toks, j)
+  | let a = _sql_alias_at(toks, nm[0])
+  | j = a[0]
+  | if (_sql_kw(toks, j) == "using"):
+      do
+        let r = _sql_parse_from_list(toks, j + 1)
+        | using_l = r[1]
+        | j = r[0]
+      end
+  | let w = _sql_parse_where_opt(toks, j)
+  | let ol = _sql_parse_order_limit(toks, w[0])
+  | let ret = _sql_parse_returning(toks, ol[0])
+  | [ret[0], {"type": "delete", "with": [], "recursive": false, "only": only, "table": join(nm[1], "."), "table_quoted": nm[2], "alias": a[1], "alias_quoted": a[2], "using": using_l,
+    "where": w[1], "order_by": ol[1], "limit": ol[2], "returning": ret[1]}]
+end
+
+# ---------------------------------------------------------------------------
+# DDL
+# ---------------------------------------------------------------------------
+
+# True when the token at i begins a column constraint rather than part of the type.
+def _sql_is_constraint_start(toks, i):
+  let k = _sql_kw(toks, i)
+  | contains(
+    ["not", "null", "default", "primary", "unique", "references", "check", "comment",
+      "auto_increment", "autoincrement", "identity", "generated", "collate", "constraint",
+      "as", "on", "charset"],
+    k)
+   || (k == "character" && _sql_kw(toks, i + 1) == "set")
+end
+
+def _sql_ref_action(toks, i):
+  let k = _sql_kw(toks, i)
+  | if (k == "set"): [i + 2, "SET " + upcase(_sql_kw(toks, i + 1))]
+    elif (k == "no"): [i + 2, "NO ACTION"]
+    else: [i + 1, upcase(k)]
+end
+
+# After the referenced columns: reads ON DELETE / ON UPDATE actions. Returns [next index, on_delete, on_update].
+def _sql_parse_ref_actions(toks, i):
+  var j = i
+  | var on_delete = None
+  | var on_update = None
+  | let _ = while (_sql_kw(toks, j) == "on" && (_sql_kw(toks, j + 1) == "delete" || _sql_kw(toks, j + 1) == "update")):
+      let a = _sql_ref_action(toks, j + 2)
+      | if (_sql_kw(toks, j + 1) == "delete"): on_delete = a[1] else: on_update = a[1]
+      | j = a[0]
+    end
+  | [j, on_delete, on_update]
+end
+
+# Parses "REFERENCES t [(cols)] [ON DELETE ..]" with the REFERENCES keyword at i. Returns [next index, reference].
+def _sql_parse_references(toks, i):
+  let nm = _sql_parse_name(toks, i + 1)
+  | let cols = if (_sql_tt(toks, nm[0]) == "("): _sql_paren_names(toks, nm[0]) else: [nm[0], [], []]
+  | let acts = _sql_parse_ref_actions(toks, cols[0])
+  | [acts[0], {"type": "reference", "table": join(nm[1], "."), "table_quoted": nm[2], "columns": cols[1], "columns_quoted": cols[2],
+    "on_delete": acts[1], "on_update": acts[2]}]
+end
+
+def _sql_parse_check_expr(toks, open):
+  let close = _sql_match_paren(toks, open)
+  | try: _sql_parse_expr(slice(toks, open + 1, close), 0)[1] catch: None
+end
+
+def _sql_parse_column(item):
+  let n = len(item)
+  | let name = item[0]["v"]
+  | var j = 1
+  | let _ = while (j < n && !_sql_is_constraint_start(item, j)):
+      if (item[j]["t"] == "("): j = _sql_match_paren(item, j) + 1 else: j += 1
+    end
+  | let ty = if (j > 1): _sql_join_tokens(slice(item, 1, j)) else: ""
+  | var nullable = true
+  | var pk = false
+  | var uq = false
+  | var auto = false
+  | var dflt = None
+  | var ref = None
+  | var chk = None
+  | var comment = None
+  | var gen = None
+  | var ident = None
+  | var auto_style = None
+  | var on_upd = None
+  | var i = j
+  | let _ = while (i < n):
+      let k = _sql_kw(item, i)
+      | if (k == "not" && _sql_kw(item, i + 1) == "null"):
+          do nullable = false | i += 2 | i end
+        elif (k == "null"):
+          do nullable = true | i += 1 | i end
+        elif (k == "primary"):
+          do pk = true | i += 1 | i end
+        elif (k == "unique"):
+          do uq = true | i += 1 | i end
+        elif (k == "auto_increment" || k == "autoincrement" || k == "identity"):
+          do auto = true | auto_style = upcase(k) | i += 1 | i end
+        elif (k == "generated" || (k == "as" && _sql_tt(item, i + 1) == "(")):
+          do
+            let mode = if (k != "generated"): None elif (_sql_kw(item, i + 1) == "always"): "ALWAYS" elif (_sql_kw(item, i + 1) == "by" && _sql_kw(item, i + 2) == "default"): "BY DEFAULT" else: None
+            | let a = if (k != "generated"): i elif (mode == "ALWAYS"): i + 2 elif (mode == "BY DEFAULT"): i + 3 else: i + 1
+            | if (_sql_kw(item, a) == "as" && _sql_kw(item, a + 1) == "identity"):
+                do
+                  ident = if (is_none(mode)): "ALWAYS" else: mode
+                  | auto = true
+                  | i = if (_sql_tt(item, a + 2) == "("): _sql_match_paren(item, a + 2) + 1 else: a + 2
+                end
+              elif (_sql_kw(item, a) == "as" && _sql_tt(item, a + 1) == "("):
+                do
+                  let close = _sql_match_paren(item, a + 1)
+                  | let e = try: _sql_parse_expr(slice(item, a + 2, close), 0)[1] catch: None
+                  | let st = if (_sql_kw(item, close + 1) == "stored" || _sql_kw(item, close + 1) == "virtual"): upcase(_sql_kw(item, close + 1)) else: None
+                  | gen = {"type": "generated", "expr": e, "mode": mode, "storage": st}
+                  | i = if (is_none(st)): close + 1 else: close + 2
+                end
+              else:
+                i += 1
+          end
+        elif (k == "on" && _sql_kw(item, i + 1) == "update"):
+          do
+            let r = try: _sql_parse_expr(item, i + 2) catch: None
+            | if (is_none(r)):
+                i += 2
+              else:
+                do on_upd = r[1] | i = r[0] end
+          end
+        elif (k == "default"):
+          do
+            let r = try: _sql_parse_expr(item, i + 1) catch: None
+            | if (is_none(r)):
+                i += 1
+              else:
+                do dflt = r[1] | i = r[0] | i end
+          end
+        elif (k == "references"):
+          do
+            let r = _sql_parse_references(item, i)
+            | ref = r[1]
+            | i = r[0]
+            | i
+          end
+        elif (k == "check" && _sql_tt(item, i + 1) == "("):
+          do
+            chk = _sql_parse_check_expr(item, i + 1)
+            | i = _sql_match_paren(item, i + 1) + 1
+            | i
+          end
+        elif (k == "comment" && _sql_tt(item, i + 1) == "str"):
+          do comment = item[i + 1]["v"] | i += 2 | i end
+        elif (k == "constraint" || k == "collate"):
+          do i += 2 | i end
+        elif (_sql_tt(item, i) == "("):
+          do i = _sql_match_paren(item, i) + 1 | i end
+        else:
+          do i += 1 | i end
+    end
+  | {
+    "type": "column_def",
+    "name": name,
+    "name_quoted": _sql_qflag(item[0]),
+    "data_type": ty,
+    "nullable": nullable,
+    "default": dflt,
+    "primary_key": pk,
+    "unique": uq,
+    "auto_increment": auto,
+    "auto_increment_style": auto_style,
+    "identity": ident,
+    "generated": gen,
+    "on_update": on_upd,
+    "references": ref,
+    "check": chk,
+    "comment": comment
+  }
+end
+
+# Index where the constraint keyword starts, skipping "CONSTRAINT [name]".
+def _sql_constraint_start(item):
+  if (_sql_kw(item, 0) != "constraint"): 0
+  elif (contains(["primary", "foreign", "unique", "check"], _sql_kw(item, 1))): 1
+  else: 2
+end
+
+def _sql_with_columns(c, names):
+  set(set(c, "columns", names[1]), "columns_quoted", names[2])
+end
+
+def _sql_constraint(kind, name):
+  {"type": "constraint", "kind": kind, "name": name, "columns": [], "columns_quoted": [], "expr": None,
+    "ref_table": None, "ref_table_quoted": [], "ref_columns": [], "ref_columns_quoted": [], "on_delete": None, "on_update": None}
+end
+
+# Parses a table constraint. kind is one of primary_key, unique, foreign_key, check, index.
+def _sql_parse_constraint(item):
+  let i0 = _sql_constraint_start(item)
+  | let cname = if (i0 > 0 && _sql_is_name_tok(item, 1)): item[1]["v"] else: None
+  | let k = _sql_kw(item, i0)
+  | let p = _sql_find_paren(item, i0)
+  | if (k == "primary" && p < len(item)):
+      _sql_with_columns(_sql_constraint("primary_key", cname), _sql_paren_names(item, p))
+    elif (k == "unique" && p < len(item)):
+      _sql_with_columns(_sql_constraint("unique", cname), _sql_paren_names(item, p))
+    elif (k == "check" && p < len(item)):
+      set(_sql_constraint("check", cname), "expr", _sql_parse_check_expr(item, p))
+    elif (k == "foreign" && p < len(item) && _sql_find_kw(item, i0, "references") < len(item)):
+      do
+        let r = _sql_find_kw(item, i0, "references")
+        | let ref = _sql_parse_references(item, r)
+        | set(set(set(set(set(set(_sql_with_columns(_sql_constraint("foreign_key", cname), _sql_paren_names(item, p)),
+          "ref_table", ref[1]["table"]),
+          "ref_table_quoted", ref[1]["table_quoted"]),
+          "ref_columns", ref[1]["columns"]),
+          "ref_columns_quoted", ref[1]["columns_quoted"]),
+          "on_delete", ref[1]["on_delete"]),
+          "on_update", ref[1]["on_update"])
+      end
+    elif (k == "exclude" || k == "like"):
+      set(_sql_constraint("other", cname), "sql", _sql_join_tokens(item))
+    elif (p < len(item)):
+      _sql_with_columns(_sql_constraint("index", if (_sql_is_name_tok(item, i0 + 1)): item[i0 + 1]["v"] else: cname), _sql_paren_names(item, p))
+    else:
+      set(_sql_constraint("other", cname), "sql", _sql_join_tokens(item))
+end
+
+# True when a body item is a table constraint rather than a column definition.
+def _sql_is_table_constraint(item):
+  let k = _sql_kw(item, 0)
+  | if (k == "constraint" || k == "check" || k == "exclude" || k == "like"):
+      true
+    elif (k == "primary" || k == "foreign"):
+      _sql_kw(item, 1) == "key"
+    elif (k == "unique"):
+      true
+    elif (k == "fulltext" || k == "spatial"):
+      true
+    elif (k == "key" || k == "index"):
+      _sql_tt(item, 1) == "("
+       || (_sql_is_name_tok(item, 1) && _sql_tt(item, 2) == "("
+ && !contains(["int", "integer", "bigint", "smallint", "tinyint", "varchar", "char", "text",
+  "date", "datetime", "timestamp", "boolean", "bool", "float", "double",
+  "decimal", "numeric", "uuid", "json", "jsonb", "blob", "real", "serial",
+  "bigserial", "time"], _sql_kw(item, 1)))
+    else:
+      false
+end
+
+# Reads the modifiers after CREATE. Returns [index of the object keyword, flags].
+def _sql_create_head(toks):
+  var i = 1
+  | var temp = false
+  | var uniq = false
+  | var matv = false
+  | var repl = false
+  | let _ = while (contains(["or", "replace", "temp", "temporary", "global", "local", "unlogged", "external", "virtual", "materialized", "unique", "recursive"], _sql_kw(toks, i))):
+      let k = _sql_kw(toks, i)
+      | if (k == "temp" || k == "temporary"): temp = true
+        elif (k == "unique"): uniq = true
+        elif (k == "materialized"): matv = true
+        elif (k == "replace"): repl = true
+      | i += 1
+    end
+  | [i, {"temporary": temp, "unique": uniq, "materialized": matv, "or_replace": repl}]
+end
+
+def _sql_unknown(src, st):
+  {"type": "unknown", "keyword": _sql_kw(st, 0), "sql": slice(src, st[0]["s"], last(st)["e"])}
+end
+
+# Parses what follows a CREATE TABLE body. Returns [comment, options, partition_by].
+def _sql_parse_table_tail(t):
+  var i = 0
+  | var comment = None
+  | var opts = []
+  | var part = None
+  | let _ = while (i < len(t)):
+      let k = _sql_kw(t, i)
+      | if (k == "partition" && _sql_kw(t, i + 1) == "by"):
+          do part = _sql_join_tokens(slice(t, i + 2, len(t))) | i = len(t) end
+        elif (k == "comment"):
+          do
+            let vi = if (_sql_is_op(t, i + 1, "=")): i + 2 else: i + 1
+            | if (_sql_tt(t, vi) == "str"):
+                do comment = t[vi]["v"] | i = vi + 1 end
+              else:
+                i += 1
+          end
+        elif (_sql_tt(t, i) == "word"):
+          do
+            let two = k == "default" && _sql_is_name_tok(t, i + 1)
+            | let nm = if (two): upcase(t[i]["v"]) + " " + upcase(t[i + 1]["v"]) else: upcase(t[i]["v"])
+            | let j = if (two): i + 2 else: i + 1
+            | if (_sql_is_op(t, j, "=") && j + 1 < len(t)):
+                do
+                  opts += [{"type": "table_option", "name": nm, "value": _sql_tok_text(t[j + 1]), "sep": "="}]
+                  | i = j + 2
+                end
+              elif (_sql_tt(t, j) == "("):
+                do
+                  let close = _sql_match_paren(t, j)
+                  | opts += [{"type": "table_option", "name": nm, "value": _sql_join_tokens(slice(t, j, close + 1)), "sep": " "}]
+                  | i = close + 1
+                end
+              else:
+                do
+                  opts += [{"type": "table_option", "name": nm, "value": None, "sep": None}]
+                  | i = j
+                end
+          end
+        else:
+          i += 1
+    end
+  | [comment, opts, part]
+end
+
+def _sql_parse_create_table(src, st, pos, flags):
+  var i = pos
+  | var ine = false
+  | if (_sql_kw(st, i) == "if" && _sql_kw(st, i + 1) == "not" && _sql_kw(st, i + 2) == "exists"): do ine = true | i += 3 end
+  | let nm = _sql_parse_name(st, i)
+  | let name = join(nm[1], ".")
+  | let open = nm[0]
+  | if (_sql_kw(st, open) == "as"):
+      do
+        let q = _sql_parse_query(st, open + 1)
+        | [q[0], {"type": "create_table", "name": name, "name_quoted": nm[2], "if_not_exists": ine, "temporary": flags["temporary"], "columns": [],
+          "constraints": [], "comment": None, "options": [], "partition_by": None, "as": q[1]}]
+      end
+    elif (_sql_tt(st, open) != "("):
+      [len(st), _sql_unknown(src, st)]
+    else:
+      do
+        let close = _sql_match_paren(st, open)
+        | let items = filter(_sql_split_commas(slice(st, open + 1, close)), ->(it): len(it) > 0;)
+        | let tail = slice(st, close + 1, len(st))
+        | let tt = _sql_parse_table_tail(tail)
+        | let cons = map(filter(items, ->(it): _sql_is_table_constraint(it);), ->(it): _sql_parse_constraint(it);)
+        | let cols = map(filter(items, ->(it): !_sql_is_table_constraint(it) && _sql_is_name_tok(it, 0);),
+          ->(it): _sql_parse_column(it);)
+        | [len(st), {"type": "create_table", "name": name, "name_quoted": nm[2], "if_not_exists": ine, "temporary": flags["temporary"],
+          "columns": cols, "constraints": cons, "comment": tt[0], "options": tt[1], "partition_by": tt[2], "as": None}]
+      end
+end
+
+def _sql_parse_create_index(src, st, pos, flags):
+  var i = _sql_accept(st, pos, "concurrently")
+  | var ine = false
+  | var iname = None
+  | var iname_q = []
+  | var incl_q = []
+  | var method = None
+  | if (_sql_kw(st, i) == "if" && _sql_kw(st, i + 1) == "not" && _sql_kw(st, i + 2) == "exists"): do ine = true | i += 3 end
+  | if (_sql_kw(st, i) != "on"):
+      do
+        let nm = _sql_parse_name(st, i)
+        | iname = join(nm[1], ".")
+        | iname_q = nm[2]
+        | i = nm[0]
+      end
+  | i = _sql_expect(st, i, "on")
+  | let tbl_only = _sql_kw(st, i) == "only"
+  | i = _sql_accept(st, i, "only")
+  | let tbl = _sql_parse_name(st, i)
+  | i = tbl[0]
+  | if (_sql_kw(st, i) == "using"):
+      do method = upcase(_sql_kw(st, i + 1)) | i += 2 end
+  | let open = _sql_expect_t(st, i, "(")
+  | let cols = _sql_parse_order_list(st, open)
+  | i = _sql_expect_t(st, cols[0], ")")
+  | var incl = []
+  | if (_sql_kw(st, i) == "include" && _sql_tt(st, i + 1) == "("):
+      do
+        let c = _sql_paren_names(st, i + 1)
+        | incl = c[1]
+        | incl_q = c[2]
+        | i = c[0]
+      end
+  | let w = _sql_parse_where_opt(st, i)
+  | [w[0], {"type": "create_index", "name": iname, "name_quoted": iname_q, "only": tbl_only, "table": join(tbl[1], "."), "table_quoted": tbl[2], "unique": flags["unique"],
+    "if_not_exists": ine, "method": method, "columns": cols[1], "include": incl, "include_quoted": incl_q, "where": w[1]}]
+end
+
+def _sql_parse_create_view(src, st, pos, flags):
+  var i = pos
+  | var ine = false
+  | var cols = []
+  | var cols_q = []
+  | if (_sql_kw(st, i) == "if" && _sql_kw(st, i + 1) == "not" && _sql_kw(st, i + 2) == "exists"): do ine = true | i += 3 end
+  | let nm = _sql_parse_name(st, i)
+  | i = nm[0]
+  | if (_sql_tt(st, i) == "("):
+      do
+        let c = _sql_paren_names(st, i)
+        | cols = c[1]
+        | cols_q = c[2]
+        | i = c[0]
+      end
+  | i = _sql_expect(st, i, "as")
+  | let q = _sql_parse_query(st, i)
+  | [q[0], {"type": "create_view", "name": join(nm[1], "."), "name_quoted": nm[2], "if_not_exists": ine, "or_replace": flags["or_replace"],
+    "temporary": flags["temporary"], "materialized": flags["materialized"], "columns": cols, "columns_quoted": cols_q, "query": q[1]}]
+end
+
+def _sql_parse_create(src, st):
+  let head = _sql_create_head(st)
+  | let k = _sql_kw(st, head[0])
+  | if (k == "table"):
+      _sql_parse_create_table(src, st, head[0] + 1, head[1])
+    elif (k == "index"):
+      _sql_parse_create_index(src, st, head[0] + 1, head[1])
+    elif (k == "view"):
+      _sql_parse_create_view(src, st, head[0] + 1, head[1])
+    else:
+      [len(st), _sql_unknown(src, st)]
+end
+
+def _sql_parse_alter_action(a):
+  let k = _sql_kw(a, 0)
+  | let k1 = _sql_kw(a, 1)
+  | if (k == "add" && contains(["constraint", "primary", "foreign", "unique", "check", "key", "index", "fulltext", "spatial"], k1)):
+      {"type": "alter_action", "action": "add_constraint", "constraint": _sql_parse_constraint(slice(a, 1, len(a)))}
+    elif (k == "add"):
+      do
+        let i0 = if (k1 == "column"): 2 else: 1
+        | let i1 = if (_sql_kw(a, i0) == "if" && _sql_kw(a, i0 + 1) == "not" && _sql_kw(a, i0 + 2) == "exists"): i0 + 3 else: i0
+        | if (_sql_is_name_tok(a, i1)):
+            {"type": "alter_action", "action": "add_column", "column": _sql_parse_column(slice(a, i1, len(a)))}
+          else:
+            {"type": "alter_action", "action": "other", "sql": _sql_join_tokens(a)}
+      end
+    elif (k == "drop" && k1 == "column" && _sql_is_name_tok(a, 2)):
+      {"type": "alter_action", "action": "drop_column", "name": a[2]["v"], "name_quoted": _sql_qflag(a[2])}
+    elif (k == "drop" && k1 == "constraint" && _sql_is_name_tok(a, 2)):
+      {"type": "alter_action", "action": "drop_constraint", "name": a[2]["v"], "name_quoted": _sql_qflag(a[2])}
+    elif (k == "rename" && k1 == "to" && _sql_is_name_tok(a, 2)):
+      {"type": "alter_action", "action": "rename_table", "to": a[2]["v"], "to_quoted": _sql_qflag(a[2])}
+    elif (k == "rename" && k1 == "column" && _sql_kw(a, 3) == "to" && _sql_is_name_tok(a, 2) && _sql_is_name_tok(a, 4)):
+      {"type": "alter_action", "action": "rename_column", "from": a[2]["v"], "from_quoted": _sql_qflag(a[2]), "to": a[4]["v"], "to_quoted": _sql_qflag(a[4])}
+    else:
+      {"type": "alter_action", "action": "other", "sql": _sql_join_tokens(a)}
+end
+
+def _sql_parse_alter(src, st):
+  if (_sql_kw(st, 1) != "table"):
+    [len(st), _sql_unknown(src, st)]
+  else:
+    do
+      var i = 2
+      | if (_sql_kw(st, i) == "if" && _sql_kw(st, i + 1) == "exists"): i += 2
+      | let alter_only = _sql_kw(st, i) == "only"
+      | i = _sql_accept(st, i, "only")
+      | let nm = _sql_parse_name(st, i)
+      | let actions = filter(_sql_split_commas(slice(st, nm[0], len(st))), ->(a): len(a) > 0;)
+      | [len(st), {"type": "alter_table", "only": alter_only, "name": join(nm[1], "."), "name_quoted": nm[2], "actions": map(actions, ->(a): _sql_parse_alter_action(a);)}]
+    end
+end
+
+def _sql_parse_drop(src, st):
+  var i = 1
+  | var cascade = false
+  | var ine = false
+  | var on_table = None
+  | var on_table_q = []
+  | let obj = _sql_kw(st, i)
+  | if (!contains(["table", "view", "index", "schema", "sequence", "database"], obj)):
+      [len(st), _sql_unknown(src, st)]
+    else:
+      do
+        i += 1
+        | if (_sql_kw(st, i) == "if" && _sql_kw(st, i + 1) == "exists"): do ine = true | i += 2 end
+        | var names = []
+        | var names_q = []
+        | var more = true
+        | let _ = while (more):
+                  let nm = _sql_parse_name(st, i)
+                  | names += [join(nm[1], ".")]
+                  | names_q += [nm[2]]
+                  | i = nm[0]
+                  | if (_sql_tt(st, i) == ","): i += 1 else: more = false
+                end
+        | if (_sql_kw(st, i) == "on" && obj == "index"):
+            do
+              let tn = _sql_parse_name(st, i + 1)
+              | on_table = join(tn[1], ".")
+              | on_table_q = tn[2]
+              | i = tn[0]
+            end
+        | if (_sql_kw(st, i) == "cascade"): do cascade = true | i += 1 end
+        | if (_sql_kw(st, i) == "restrict"): i += 1
+        | [i, {"type": "drop", "object": upcase(obj), "if_exists": ine, "names": names, "names_quoted": names_q, "cascade": cascade, "on_table": on_table, "on_table_quoted": on_table_q}]
+      end
+end
+
+def _sql_parse_truncate(st):
+  var i = _sql_accept(st, 1, "table")
+  | let trunc_only = _sql_kw(st, i) == "only"
+  | i = _sql_accept(st, i, "only")
+  | var names = []
+  | var names_q = []
+  | var more = true
+  | let _ = while (more):
+      let nm = _sql_parse_name(st, i)
+      | names += [join(nm[1], ".")]
+      | names_q += [nm[2]]
+      | i = nm[0]
+      | if (_sql_tt(st, i) == ","): i += 1 else: more = false
+    end
+  | [len(st), {"type": "truncate", "only": trunc_only, "tables": names, "tables_quoted": names_q}]
+end
+
+def _sql_parse_comment_on(src, st):
+  if (_sql_kw(st, 1) != "on" || !_sql_is_name_tok(st, 3)):
+    [len(st), _sql_unknown(src, st)]
+  else:
+    do
+      let nm = _sql_parse_name(st, 3)
+      | let j = _sql_expect(st, nm[0], "is")
+      | if (_sql_tt(st, j) == "str"):
+          [j + 1, {"type": "comment_on", "object": upcase(_sql_kw(st, 2)), "name": join(nm[1], "."), "name_quoted": nm[2], "text": st[j]["v"]}]
+        else:
+          [_sql_expect(st, j, "null"), {"type": "comment_on", "object": upcase(_sql_kw(st, 2)), "name": join(nm[1], "."), "name_quoted": nm[2], "text": None}]
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Statements
+# ---------------------------------------------------------------------------
+
+# WITH followed by a query or by INSERT / UPDATE / DELETE.
+def _sql_parse_with_statement(toks):
+  let w = _sql_parse_with(toks, 0)
+  | let k = _sql_kw(toks, w[0])
+  | if (k == "insert" || k == "update" || k == "delete"):
+      do
+        let r = if (k == "insert"): _sql_parse_insert(toks, w[0]) elif (k == "update"): _sql_parse_update(toks, w[0]) else: _sql_parse_delete(toks, w[0])
+        | [r[0], set(set(r[1], "with", w[1]), "recursive", w[2])]
+      end
+    else:
+      _sql_parse_query(toks, 0)
+end
+
+def _sql_parse_statement(src, st):
+  let k = _sql_kw(st, 0)
+  | let r = if (k == "with"): _sql_parse_with_statement(st)
+    elif (k == "select" || k == "values" || _sql_tt(st, 0) == "("): _sql_parse_query(st, 0)
+    elif (k == "insert"): _sql_parse_insert(st, 0)
+    elif (k == "update"): _sql_parse_update(st, 0)
+    elif (k == "delete"): _sql_parse_delete(st, 0)
+    elif (k == "create"): _sql_parse_create(src, st)
+    elif (k == "alter"): _sql_parse_alter(src, st)
+    elif (k == "drop"): _sql_parse_drop(src, st)
+    elif (k == "truncate"): _sql_parse_truncate(st)
+    elif (k == "comment"): _sql_parse_comment_on(src, st)
+    else: [len(st), _sql_unknown(src, st)]
+  | if (r[0] < len(st)): _sql_err(st, r[0], "unexpected token") else: r[1]
+end
+
+# Parses SQL text into an array of statement stmt_nodes. Every node is a dict with a "type" field.
+# Statements that are not understood (GRANT, SET, ...) become {"type": "unknown", "keyword", "sql"}.
+def sql_ast(input):
+  let src = to_string(input)
+  | map(_sql_split_statements(_sql_lex(src)), ->(st): _sql_parse_statement(src, st);)
+end
+
+# Returns every node of the given type found anywhere inside node (a node or an array of stmt_nodes).
+def sql_find(node, type):
+  if (is_array(node)):
+    flatten(map(node, ->(n): sql_find(n, type);))
+  elif (is_dict(node)):
+    (if (get(node, "type") == type): [node] else: []) + flatten(map(values(node), ->(v): sql_find(v, type);))
+  else:
+    []
+end
+
+# ---------------------------------------------------------------------------
+# Printer
+# ---------------------------------------------------------------------------
+
+def _sql_q(n):
+  if (is_regex_match(n, "^(@@|[@#])?[A-Za-z_][A-Za-z0-9_$]*$") && !_sql_is_reserved(downcase(n))): n
+  else: "\"" + replace(n, "\"", "\"\"") + "\""
+end
+
+# Quotes a name when it was quoted in the source or needs quoting to be valid.
+def _sql_qf(name, quoted):
+  if (is_string(quoted) || quoted == true):
+    do
+      let open = if (quoted == true): "\"" else: quoted
+      | let close = if (open == "["): "]" else: open
+      | open + replace(name, close, close + close) + close
+    end
+  else:
+    _sql_q(name)
+end
+
+def _sql_qjoin(parts, flags, sep):
+  if (is_empty(parts)): ""
+  else: join(map(range(0, len(parts) - 1), ->(i): _sql_qf(parts[i], if (is_none(flags) || i >= len(flags)): false else: flags[i]);), sep)
+end
+
+def _sql_qname(dotted):
+  join(map(split(dotted, "\\."), ->(p): _sql_q(p);), ".")
+end
+
+# Dotted name stored in field f of node n, with flags in f_quoted.
+def _sql_fq(n, f):
+  _sql_qjoin(split(n[f], "\\."), get(n, f + "_quoted"), ".")
+end
+
+# List of names stored in field f of node n.
+def _sql_fl(n, f):
+  _sql_qjoin(n[f], get(n, f + "_quoted"), ", ")
+end
+
+# Single name stored in field f of node n.
+def _sql_fs(n, f):
+  _sql_qf(n[f], get(n, f + "_quoted"))
+end
+
+def _sql_str(v):
+  "'" + replace(v, "'", "''") + "'"
+end
+
+def _sql_list(items):
+  join(map(items, ->(x): _sql_s(x);), ", ")
+end
+
+def _sql_names(items):
+  join(map(items, ->(x): _sql_q(x);), ", ")
+end
+
+def _sql_op_bp(op):
+  if (op == "OR"): 1
+  elif (op == "AND"): 2
+  elif (contains(["||", "->", "->>", "#>", "#>>", "@>", "<@", "&&", "~", "~*", "!~", "!~*", "<<", ">>"], op)): 5
+  elif (op == "+" || op == "-"): 6
+  elif (op == "*" || op == "/" || op == "%"): 7
+  elif (op == "^"): 8
+  elif (op == "AT TIME ZONE"): 10
+  elif (op == ":="): 1
+  else: 4
+end
+
+# Binding power of an expression node, used to decide where parentheses are needed.
+def _sql_node_bp(n):
+  let t = n["type"]
+  | if (t == "binary"): _sql_op_bp(n["op"])
+    elif (t == "between" || t == "in" || t == "is"): 4
+    elif (t == "unary"): if (n["op"] == "NOT"): 3 else: 9
+    elif (t == "cast" || t == "collate"): 10
+    elif (t == "subscript"): 11
+    else: 100
+end
+
+def _sql_sbp(n, min_bp):
+  if (_sql_node_bp(n) < min_bp && get(n, "paren") != true): "(" + _sql_s(n) + ")" else: _sql_s(n)
+end
+
+def _sql_s_call(n):
+  let args = n["args"]
+  | let seps = get(n, "seps")
+  | let ok = !is_none(seps) && len(args) > 1 && len(seps) == len(args) - 1
+  | let body = if (len(args) == 0): ""
+    elif (ok): fold(range(1, len(args) - 1), _sql_s(args[0]), ->(acc, i): acc + (if (seps[i - 1] == ","): ", " else: " " + seps[i - 1] + " ") + _sql_s(args[i]);)
+    else: _sql_list(args)
+  | let modifier = if (is_none(get(n, "modifier"))): "" else: n["modifier"] + " "
+  | let dist = if (n["distinct"]): "DISTINCT " else: ""
+  | let filt = if (is_none(get(n, "filter"))): "" else: " FILTER (WHERE " + _sql_s(n["filter"]) + ")"
+  | let over = if (is_none(get(n, "over"))): "" else: " OVER " + _sql_s_window(n["over"])
+  | let agg_order = if (is_empty(get(n, "order_by") ?? [])): "" else: " ORDER BY " + _sql_list(n["order_by"])
+  | let within = if (is_empty(get(n, "within_group") ?? [])): "" else: " WITHIN GROUP (ORDER BY " + _sql_list(n["within_group"]) + ")"
+  | n["name"] + "(" + dist + modifier + body + agg_order + ")" + within + filt + over
+end
+
+def _sql_s_window_spec(w):
+  let parts = (if (is_none(w["name"])): [] else: [_sql_q(w["name"])])
+     + (if (is_empty(w["partition_by"])): [] else: ["PARTITION BY " + _sql_list(w["partition_by"])])
+     + (if (is_empty(w["order_by"])): [] else: ["ORDER BY " + _sql_list(w["order_by"])])
+     + (if (is_none(w["frame"])): [] else: [w["frame"]])
+  | "(" + join(parts, " ") + ")"
+end
+
+def _sql_s_window(w):
+  if (!is_none(w["name"]) && is_empty(w["partition_by"]) && is_empty(w["order_by"]) && is_none(w["frame"])):
+    _sql_q(w["name"])
+  else:
+    _sql_s_window_spec(w)
+end
+
+def _sql_s_case(n):
+  let operand = if (is_none(n["operand"])): "" else: " " + _sql_s(n["operand"])
+  | let whens = join(map(n["whens"], ->(w): " WHEN " + _sql_s(w["condition"]) + " THEN " + _sql_s(w["result"]);), "")
+  | let els = if (is_none(n["else"])): "" else: " ELSE " + _sql_s(n["else"])
+  | "CASE" + operand + whens + els + " END"
+end
+
+def _sql_s_literal(n):
+  let kind = n["kind"]
+  | if (kind == "string"): (if (is_none(get(n, "prefix"))): "" else: n["prefix"]) + _sql_str(n["value"])
+    elif (kind == "null"): "NULL"
+    elif (kind == "default"): "DEFAULT"
+    elif (kind == "all"): "ALL"
+    elif (kind == "boolean"): if (n["value"]): "TRUE" else: "FALSE"
+    else: n["value"]
+end
+
+def _sql_s_expr(n):
+  if (get(n, "paren") == true): "(" + _sql_s_expr_inner(n) + ")" else: _sql_s_expr_inner(n)
+end
+
+def _sql_s_expr_inner(n):
+  let t = n["type"]
+  | if (t == "literal"):
+      _sql_s_literal(n)
+    elif (t == "typed_literal"):
+      n["data_type"] + " " + _sql_str(n["value"]) + (if (is_none(get(n, "unit"))): "" else: " " + n["unit"])
+    elif (t == "ident"):
+      _sql_qjoin(n["parts"], get(n, "parts_quoted"), ".")
+    elif (t == "star"):
+      if (is_none(n["table"])): "*" else: _sql_fq(n, "table") + ".*"
+    elif (t == "param"):
+      n["value"]
+    elif (t == "unary"):
+      if (n["op"] == "NOT"): "NOT " + _sql_sbp(n["expr"], 3) else: n["op"] + _sql_sbp(n["expr"], 9)
+    elif (t == "binary"):
+      do
+        let bp = _sql_op_bp(n["op"])
+        | _sql_sbp(n["left"], bp) + " " + n["op"] + " " + _sql_sbp(n["right"], bp + 1)
+         + (if (is_none(get(n, "escape"))): "" else: " ESCAPE " + _sql_sbp(n["escape"], 5))
+      end
+    elif (t == "is"):
+      _sql_sbp(n["expr"], 5) + " IS " + (if (n["negated"]): "NOT " else: "") + n["what"]
+    elif (t == "between"):
+      _sql_sbp(n["expr"], 5) + (if (n["negated"]): " NOT" else: "") + " BETWEEN " + _sql_sbp(n["low"], 5) + " AND " + _sql_sbp(n["high"], 5)
+    elif (t == "in"):
+      _sql_sbp(n["expr"], 5) + (if (n["negated"]): " NOT" else: "") + " IN ("
+       + (if (is_none(n["query"])): _sql_list(n["values"]) else: _sql_s_query(n["query"])) + ")"
+    elif (t == "call"):
+      _sql_s_call(n)
+    elif (t == "case"):
+      _sql_s_case(n)
+    elif (t == "cast"):
+      if (n["style"] == "cast"): "CAST(" + _sql_s(n["expr"]) + " AS " + n["data_type"] + ")"
+      else: _sql_sbp(n["expr"], 10) + "::" + n["data_type"]
+    elif (t == "exists"):
+      "EXISTS (" + _sql_s_query(n["query"]) + ")"
+    elif (t == "subquery"):
+      "(" + _sql_s_query(n["query"]) + ")"
+    elif (t == "tuple"):
+      "(" + _sql_list(n["items"]) + ")"
+    elif (t == "array"):
+      "ARRAY[" + _sql_list(n["items"]) + "]"
+    elif (t == "quantified"):
+      n["quantifier"] + " (" + (if (is_none(n["query"])): _sql_s(n["expr"]) else: _sql_s_query(n["query"])) + ")"
+    elif (t == "collate"):
+      _sql_sbp(n["expr"], 10) + " COLLATE " + _sql_fq(n, "collation")
+    elif (t == "subscript"):
+      _sql_sbp(n["expr"], 11) + "[" + _sql_s(n["index"]) + (if (is_none(n["upper"])): "" else: ":" + _sql_s(n["upper"])) + "]"
+    else:
+      error("sql: cannot print node of type " + to_string(t))
+end
+
+def _sql_s_alias(n):
+  if (is_none(n["alias"])): "" else: " AS " + _sql_fs(n, "alias")
+end
+
+def _sql_fnames(n, f):
+  if (is_empty(n[f])): ""
+  else:
+    do
+      let flags = get(n, f + "_quoted")
+      | join(map(range(0, len(n[f]) - 1), ->(i): _sql_qjoin(split(n[f][i], "\\."), if (is_none(flags) || i >= len(flags)): None else: flags[i], ".");), ", ")
+    end
+end
+
+def _sql_s_table(n):
+  let t = n["type"]
+  | if (t == "table"):
+      (if (get(n, "only") == true): "ONLY " else: "") + _sql_fq(n, "name") + _sql_s_alias(n)
+       + (if (is_none(get(n, "tablesample"))): "" else:" TABLESAMPLE " + n["tablesample"]["method"] + " (" + _sql_list(n["tablesample"]["args"]) + ")"
+   + (if (is_none(n["tablesample"]["repeatable"])): "" else: " REPEATABLE (" + _sql_s(n["tablesample"]["repeatable"]) + ")"))
+       + (if (is_none(get(n, "hints"))): "" else: " WITH (" + n["hints"] + ")")
+    elif (t == "subquery"):
+      (if (get(n, "lateral") == true): "LATERAL " else: "") + "(" + _sql_s_query(n["query"]) + ")" + _sql_s_alias(n)
+       + (if (is_empty(n["columns"])): "" else: " (" + _sql_fl(n, "columns") + ")")
+    elif (t == "table_function"):
+      (if (get(n, "lateral") == true): "LATERAL " else: "") + n["name"] + "(" + _sql_list(n["args"]) + ")" + _sql_s_alias(n)
+       + (if (is_empty(get(n, "columns") ?? [])): "" else: " (" + _sql_fl(n, "columns") + ")")
+    else:
+      do
+        let right = if (n["right"]["type"] == "join"): "(" + _sql_s(n["right"]) + ")" else: _sql_s(n["right"])
+        | _sql_s(n["left"]) + " " + (if (n["natural"]): "NATURAL " else: "")
+         + (if (n["kind"] == "STRAIGHT_JOIN" || ends_with(n["kind"], "APPLY")): n["kind"] + " "
+elif (n["kind"] == "INNER"): (if (get(n, "inner") == false): "JOIN " else: "INNER JOIN ")
+else: n["kind"] + (if (get(n, "outer") == true): " OUTER" else: "") + " JOIN ") + right
+         + (if (is_none(n["on"])): "" else: " ON " + _sql_s(n["on"]))
+         + (if (is_empty(n["using"])): "" else: " USING (" + _sql_fl(n, "using") + ")")
+      end
+end
+
+def _sql_s_cte(c):
+  _sql_fs(c, "name") + (if (is_empty(c["columns"])): "" else: " (" + _sql_fl(c, "columns") + ")") + " AS "
+   + (if (is_none(get(c, "materialized"))): "" else: c["materialized"] + " ") + "(" + _sql_s_query(c["query"]) + ")"
+end
+
+def _sql_s_with(q):
+  if (is_empty(get(q, "with") ?? [])):
+    ""
+  else:
+    "WITH " + (if (get(q, "recursive") == true): "RECURSIVE " else: "") + join(map(q["with"], ->(c): _sql_s_cte(c);), ", ") + " "
+end
+
+def _sql_s_tail(q):
+  (if (is_empty(q["order_by"])): "" else: " ORDER BY " + _sql_list(q["order_by"]))
+   + (if (is_none(q["limit"])): "" else: " LIMIT " + _sql_s(q["limit"]))
+   + (if (is_none(q["offset"])): "" else: " OFFSET " + _sql_s(q["offset"]) + (if (is_none(get(q, "offset_rows"))): "" else: " " + q["offset_rows"]))
+   + (if (is_none(get(q, "fetch"))): ""
+else: " FETCH " + (if (get(q["fetch"], "next") == true): "NEXT " else: "FIRST ") + (if (is_none(q["fetch"]["count"])): "" else: _sql_s(q["fetch"]["count"]) + " ")
+   + (get(q["fetch"], "unit") ?? "ROWS") + " " + (if (q["fetch"]["with_ties"]): "WITH TIES" else: "ONLY"))
+   + join(map(get(q, "locking") ?? [], ->(l): (if (starts_with(l["strength"], "LOCK")): " " + l["strength"] else: " FOR " + l["strength"] + (if (is_empty(l["of"])): "" else: " OF " + join(map(l["of"], ->(x): _sql_qname(x);), ", ")) + (if (is_none(l["wait"])): "" else: " " + l["wait"]));), "")
+end
+
+def _sql_s_set_child(c):
+  if (get(c, "paren") != true && (!is_empty(c["order_by"]) || !is_none(c["limit"]) || !is_none(c["offset"]))):
+    "(" + _sql_s_query(c) + ")"
+  else:
+    _sql_s_query(c)
+end
+
+def _sql_s_select_core(q):
+  "SELECT " + (if (q["distinct"]): "DISTINCT " elif (get(q, "select_all") == true): "ALL " else: "")
+   + (if (is_empty(q["distinct_on"])): "" else: "ON (" + _sql_list(q["distinct_on"]) + ") ")
+   + (if (is_none(get(q, "top"))): "" else: "TOP " + _sql_sbp(q["top"]["count"], 10) + (if (q["top"]["percent"]): " PERCENT" else: "") + (if (q["top"]["with_ties"]): " WITH TIES" else: "") + " ")
+   + _sql_list(q["columns"])
+   + (if (is_empty(q["from"])): "" else: " FROM " + _sql_list(q["from"]))
+   + (if (is_none(q["where"])): "" else: " WHERE " + _sql_s(q["where"]))
+   + (if (is_empty(q["group_by"])): "" else: " GROUP BY " + _sql_list(q["group_by"]) + (if (is_none(get(q, "group_by_modifier"))): "" else: " " + q["group_by_modifier"]))
+   + (if (is_none(q["having"])): "" else: " HAVING " + _sql_s(q["having"]))
+   + (if (is_empty(get(q, "windows") ?? [])): "" else: " WINDOW " + join(map(q["windows"], ->(w): _sql_q(w["name"]) + " AS " + _sql_s_window_spec(w["spec"]);), ", "))
+end
+
+def _sql_s_query(q):
+  let t = q["type"]
+  | let core = if (t == "select"): _sql_s_select_core(q)
+    elif (t == "values"): "VALUES " + join(map(q["rows"], ->(r): "(" + _sql_list(r) + ")";), ", ")
+    else: _sql_s_set_child(q["left"]) + " " + q["op"] + (if (q["all"]): " ALL " else: " ") + _sql_s_set_child(q["right"])
+  | let s = _sql_s_with(q) + core + _sql_s_tail(q)
+  | if (get(q, "paren") == true): "(" + s + ")" else: s
+end
+
+def _sql_s_references(r):
+  "REFERENCES " + _sql_fq(r, "table") + (if (is_empty(r["columns"])): "" else: " (" + _sql_fl(r, "columns") + ")")
+   + (if (is_none(r["on_delete"])): "" else: " ON DELETE " + r["on_delete"])
+   + (if (is_none(r["on_update"])): "" else: " ON UPDATE " + r["on_update"])
+end
+
+def _sql_s_column(c):
+  _sql_fs(c, "name") + (if (c["data_type"] == ""): "" else: " " + c["data_type"])
+   + (if (c["nullable"]): "" else: " NOT NULL")
+   + (if (is_none(c["default"])): "" else: " DEFAULT " + _sql_s(c["default"]))
+   + (if (is_none(get(c, "on_update"))): "" else: " ON UPDATE " + _sql_s(c["on_update"]))
+   + (if (is_none(get(c, "generated"))): ""
+else:(if (is_none(c["generated"]["mode"])): " AS (" else: " GENERATED " + c["generated"]["mode"] + " AS (") + _sql_s(c["generated"]["expr"]) + ")"
+   + (if (is_none(c["generated"]["storage"])): "" else: " " + c["generated"]["storage"]))
+   + (if (!is_none(get(c, "identity"))): " GENERATED " + c["identity"] + " AS IDENTITY"
+elif (c["auto_increment"]): " " + (get(c, "auto_increment_style") ?? "AUTO_INCREMENT")
+else: "")
+   + (if (c["primary_key"]): " PRIMARY KEY" else: "")
+   + (if (c["unique"]): " UNIQUE" else: "")
+   + (if (is_none(c["references"])): "" else: " " + _sql_s_references(c["references"]))
+   + (if (is_none(c["check"])): "" else: " CHECK (" + _sql_s(c["check"]) + ")")
+   + (if (is_none(c["comment"])): "" else: " COMMENT " + _sql_str(c["comment"]))
+end
+
+def _sql_s_constraint(c):
+  let cols = "(" + _sql_fl(c, "columns") + ")"
+  | let prefix = if (is_none(c["name"]) || c["kind"] == "index" || c["kind"] == "other"): "" else: "CONSTRAINT " + _sql_q(c["name"]) + " "
+  | let k = c["kind"]
+  | if (k == "primary_key"): prefix + "PRIMARY KEY " + cols
+    elif (k == "unique"): prefix + "UNIQUE " + cols
+    elif (k == "check"): prefix + "CHECK (" + _sql_s(c["expr"]) + ")"
+    elif (k == "foreign_key"):
+      prefix + "FOREIGN KEY " + cols + " " + _sql_s_references({"table": c["ref_table"], "table_quoted": get(c, "ref_table_quoted"), "columns": c["ref_columns"], "columns_quoted": get(c, "ref_columns_quoted"), "on_delete": c["on_delete"], "on_update": c["on_update"]})
+    elif (k == "index"): "KEY " + (if (is_none(c["name"])): "" else: _sql_q(c["name"]) + " ") + cols
+    else: c["sql"]
+end
+
+def _sql_s_alter_action(a):
+  let k = a["action"]
+  | if (k == "add_constraint"): "ADD " + _sql_s_constraint(a["constraint"])
+    elif (k == "add_column"): "ADD COLUMN " + _sql_s_column(a["column"])
+    elif (k == "drop_column"): "DROP COLUMN " + _sql_fs(a, "name")
+    elif (k == "drop_constraint"): "DROP CONSTRAINT " + _sql_fs(a, "name")
+    elif (k == "rename_table"): "RENAME TO " + _sql_fs(a, "to")
+    elif (k == "rename_column"): "RENAME COLUMN " + _sql_fs(a, "from") + " TO " + _sql_fs(a, "to")
+    else: a["sql"]
+end
+
+def _sql_s_assignment(a):
+  (if (is_empty(get(a, "columns") ?? [])): _sql_fq(a, "column") else: "(" + _sql_fl(a, "columns") + ")") + " = " + _sql_s(a["value"])
+end
+
+def _sql_s_assignments(items):
+  join(map(items, ->(a): _sql_s_assignment(a);), ", ")
+end
+
+def _sql_s_returning(items):
+  if (is_empty(items)): "" else: " RETURNING " + _sql_list(items)
+end
+
+def _sql_s_order_limit(n):
+  (if (is_empty(get(n, "order_by") ?? [])): "" else: " ORDER BY " + _sql_list(n["order_by"]))
+   + (if (is_none(get(n, "limit"))): "" else: " LIMIT " + _sql_s(n["limit"]))
+end
+
+def _sql_s_where(w):
+  if (is_none(w)): "" else: " WHERE " + _sql_s(w)
+end
+
+def _sql_s_conflict(c):
+  if (is_none(c)):
+    ""
+  else:
+    " ON CONFLICT" + (if (is_empty(c["target"])): "" else: " (" + _sql_fl(c, "target") + ")")
+     + (if (is_none(get(c, "constraint"))): "" else: " ON CONSTRAINT " + _sql_q(c["constraint"]))
+     + (if (c["action"] == "NOTHING"): " DO NOTHING" else: " DO UPDATE SET " + _sql_s_assignments(c["set"]) + _sql_s_where(c["where"]))
+end
+
+def _sql_s_insert(n):
+  _sql_s_with(n) + "INSERT " + (if (is_none(n["modifier"])): "" else: n["modifier"] + " ") + "INTO " + _sql_fq(n, "table")
+   + (if (is_empty(n["columns"])): "" else: " (" + _sql_fl(n, "columns") + ")")
+   + (if (!is_empty(get(n, "set") ?? [])): " SET " + _sql_s_assignments(n["set"]) elif (is_none(n["source"])): " DEFAULT VALUES" else: " " + _sql_s_query(n["source"]))
+   + _sql_s_conflict(n["on_conflict"])
+   + (if (is_empty(n["on_duplicate_key_update"])): "" else: " ON DUPLICATE KEY UPDATE " + _sql_s_assignments(n["on_duplicate_key_update"]))
+   + _sql_s_returning(n["returning"])
+end
+
+def _sql_s_create_table(n):
+  let head = "CREATE " + (if (n["temporary"]): "TEMPORARY " else: "") + "TABLE " + (if (n["if_not_exists"]): "IF NOT EXISTS " else: "") + _sql_fq(n, "name")
+  | if (!is_none(n["as"])):
+      head + " AS " + _sql_s_query(n["as"])
+    else:
+      head + " (\n  " + join(map(n["columns"], ->(c): _sql_s_column(c);) + map(n["constraints"], ->(c): _sql_s_constraint(c);), ",\n  ") + "\n)"
+       + join(map(get(n, "options") ?? [], ->(o): " " + o["name"] + (if (o["sep"] == "="): "=" + o["value"] elif (o["sep"] == " "): " " + o["value"] else: "");), "")
+       + (if (is_none(get(n, "partition_by"))): "" else: " PARTITION BY " + n["partition_by"])
+       + (if (is_none(n["comment"])): "" else: " COMMENT = " + _sql_str(n["comment"]))
+end
+
+def _sql_s_create_index(n):
+  "CREATE " + (if (n["unique"]): "UNIQUE " else: "") + "INDEX " + (if (n["if_not_exists"]): "IF NOT EXISTS " else: "")
+   + (if (is_none(n["name"])): "" else: _sql_fq(n, "name") + " ") + "ON " + (if (get(n, "only") == true): "ONLY " else: "") + _sql_fq(n, "table")
+   + (if (is_none(n["method"])): "" else: " USING " + n["method"]) + " (" + _sql_list(n["columns"]) + ")"
+   + (if (is_empty(get(n, "include") ?? [])): "" else: " INCLUDE (" + _sql_fl(n, "include") + ")") + _sql_s_where(n["where"])
+end
+
+def _sql_s_create_view(n):
+  "CREATE " + (if (n["or_replace"]): "OR REPLACE " else: "") + (if (n["temporary"]): "TEMPORARY " else: "")
+   + (if (n["materialized"]): "MATERIALIZED " else: "") + "VIEW " + (if (n["if_not_exists"]): "IF NOT EXISTS " else: "")
+   + _sql_fq(n, "name") + (if (is_empty(n["columns"])): "" else: " (" + _sql_fl(n, "columns") + ")")
+   + " AS " + _sql_s_query(n["query"])
+end
+
+def _sql_s_stmt(n):
+  let t = n["type"]
+  | if (t == "insert"): _sql_s_insert(n)
+    elif (t == "update"):
+      _sql_s_with(n) + "UPDATE " + (if (get(n, "only") == true): "ONLY " else: "") + _sql_fq(n, "table") + _sql_s_alias(n) + " SET " + _sql_s_assignments(n["set"])
+       + (if (is_empty(n["from"])): "" else: " FROM " + _sql_list(n["from"])) + _sql_s_where(n["where"]) + _sql_s_order_limit(n) + _sql_s_returning(n["returning"])
+    elif (t == "delete"):
+      _sql_s_with(n) + "DELETE FROM " + (if (get(n, "only") == true): "ONLY " else: "") + _sql_fq(n, "table") + _sql_s_alias(n)
+       + (if (is_empty(n["using"])): "" else: " USING " + _sql_list(n["using"])) + _sql_s_where(n["where"]) + _sql_s_order_limit(n) + _sql_s_returning(n["returning"])
+    elif (t == "create_table"): _sql_s_create_table(n)
+    elif (t == "create_index"): _sql_s_create_index(n)
+    elif (t == "create_view"): _sql_s_create_view(n)
+    elif (t == "alter_table"):
+      "ALTER TABLE " + (if (get(n, "only") == true): "ONLY " else: "") + _sql_fq(n, "name") + " " + join(map(n["actions"], ->(a): _sql_s_alter_action(a);), ", ")
+    elif (t == "drop"):
+      "DROP " + n["object"] + " " + (if (n["if_exists"]): "IF EXISTS " else: "") + _sql_fnames(n, "names")
+       + (if (is_none(n["on_table"])): "" else: " ON " + _sql_qjoin(split(n["on_table"], "\\."), get(n, "on_table_quoted"), ".")) + (if (n["cascade"]): " CASCADE" else: "")
+    elif (t == "truncate"): "TRUNCATE TABLE " + (if (get(n, "only") == true): "ONLY " else: "") + _sql_fnames(n, "tables")
+    elif (t == "comment_on"):
+      "COMMENT ON " + n["object"] + " " + _sql_fq(n, "name") + " IS " + (if (is_none(n["text"])): "NULL" else: _sql_str(n["text"]))
+    else: n["sql"]
+end
+
+# Dispatches on node type for statements, queries, expressions and clauses.
+def _sql_s(n):
+  let t = n["type"]
+  | if (t == "select" || t == "set_op" || t == "values"): _sql_s_query(n)
+    elif (t == "table" || t == "join" || t == "table_function"): _sql_s_table(n)
+    elif (t == "subquery" && contains(keys(n), "alias")): _sql_s_table(n)
+    elif (t == "select_item"): _sql_s(n["expr"]) + _sql_s_alias(n)
+    elif (t == "order_item"):
+      _sql_s(n["expr"]) + (if (is_none(n["direction"])): "" else: " " + n["direction"]) + (if (is_none(n["nulls"])): "" else: " NULLS " + n["nulls"])
+    elif (t == "window"): _sql_s_window(n)
+    elif (t == "cte"): _sql_s_cte(n)
+    elif (t == "named_window"): _sql_q(n["name"]) + " AS " + _sql_s_window_spec(n["spec"])
+    elif (t == "column_def"): _sql_s_column(n)
+    elif (t == "constraint"): _sql_s_constraint(n)
+    elif (t == "reference"): _sql_s_references(n)
+    elif (t == "assignment"): _sql_s_assignment(n)
+    elif (t == "on_conflict"): _sql_s_conflict(n)
+    elif (t == "alter_action"): _sql_s_alter_action(n)
+    elif (contains(["insert", "update", "delete", "create_table", "create_index", "create_view", "alter_table", "drop", "truncate", "comment_on", "unknown"], t)): _sql_s_stmt(n)
+    else: _sql_s_expr(n)
+end
+
+# Prints an AST node as SQL. An array of statements is printed one per line, each ending with ";".
+def sql_stringify(node):
+  if (is_array(node)): join(map(node, ->(n): _sql_s(n) + ";";), "\n") else: _sql_s(node)
+end
+
+# ---------------------------------------------------------------------------
+# Table definitions and Markdown
+# ---------------------------------------------------------------------------
+
+def _sql_is_schema_stmt(st):
+  let k = _sql_kw(st, 0)
+  | if (k == "create"): _sql_kw(st, _sql_create_head(st)[0]) == "table"
+    elif (k == "alter"): _sql_kw(st, 1) == "table"
+    elif (k == "comment"): _sql_kw(st, 1) == "on"
+    else: false
+end
+
+def _sql_last_part(n):
+  last(split(downcase(n), "\\."))
+end
+
+def _sql_name_match(a, b):
+  let la = downcase(a)
+  | let lb = downcase(b)
+  | la == lb || ((!contains(la, ".") || !contains(lb, ".")) && _sql_last_part(la) == _sql_last_part(lb))
+end
+
+def _sql_apply_extra(tbl, x):
+  if (!_sql_name_match(tbl["name"], x["table"])):
+    tbl
+  elif (x["kind"] == "constraint"):
+    set(tbl, "constraints", tbl["constraints"] + [x["constraint"]])
+  elif (x["kind"] == "table_comment"):
+    set(tbl, "comment", x["text"])
+  else:
+    set(tbl, "col_comments", set(tbl["col_comments"], x["column"], x["text"]))
+end
+
+# Table-level changes carried by ALTER TABLE and COMMENT ON statements.
+def _sql_extras(node):
+  let t = node["type"]
+  | if (t == "alter_table"):
+      map(filter(node["actions"], ->(a): a["action"] == "add_constraint";),
+        ->(a): {"table": node["name"], "kind": "constraint", "constraint": a["constraint"]};)
+    elif (t == "comment_on" && node["object"] == "TABLE"):
+      [{"table": node["name"], "kind": "table_comment", "text": node["text"]}]
+    elif (t == "comment_on" && node["object"] == "COLUMN" && contains(node["name"], ".")):
+      do
+        let parts = split(node["name"], "\\.")
+        | [{"table": join(slice(parts, 0, len(parts) - 1), "."), "kind": "column_comment", "column": last(parts), "text": node["text"]}]
+      end
+    else:
+      []
+end
+
+def _sql_ref_string(fk, idx):
+  let rc = if (idx < len(fk["ref_columns"])): fk["ref_columns"][idx] else: None
+  | if (is_none(rc)): fk["ref_table"] else: fk["ref_table"] + "." + rc
+end
+
+# Folds table constraints and column-level flags into the public table shape.
+def _sql_finalize(tbl):
+  let cons = tbl["constraints"]
+  | let pk_cols = flatten(map(filter(cons, ->(c): c["kind"] == "primary_key";), ->(c): c["columns"];))
+  | let pk_lower = map(pk_cols, ->(c): downcase(c);)
+  | let uniques = map(filter(cons, ->(c): c["kind"] == "unique";), ->(c): c["columns"];)
+  | let single_unique = map(filter(uniques, ->(u): len(u) == 1;), ->(u): downcase(u[0]);)
+  | let col_fks = map(
+    filter(tbl["columns"], ->(c): !is_none(c["references"]);),
+    ->(c): {"columns": [c["name"]], "ref_table": c["references"]["table"], "ref_columns": c["references"]["columns"]};)
+  | let fks = map(filter(cons, ->(c): c["kind"] == "foreign_key";),
+    ->(c): {"columns": c["columns"], "ref_table": c["ref_table"], "ref_columns": c["ref_columns"]};)
+     + col_fks
+  | let columns = map(tbl["columns"], ->(c):
+      let lname = downcase(c["name"])
+      | let is_pk = c["primary_key"] || contains(pk_lower, lname)
+      | let my_refs = filter(
+        map(fks, ->(fk): do
+            let idx = index(map(fk["columns"], ->(x): downcase(x);), lname)
+            | if (is_none(idx) || idx < 0): None else: _sql_ref_string(fk, idx)
+          end;),
+        ->(r): !is_none(r);)
+      | let cmt = if (is_none(get(tbl["col_comments"], c["name"]))): c["comment"] else: get(tbl["col_comments"], c["name"])
+      | {
+        "name": c["name"],
+        "type": c["data_type"],
+        "nullable": c["nullable"] && !is_pk,
+        "default": if (is_none(c["default"])): None else: sql_stringify(c["default"]),
+        "primary_key": is_pk,
+        "unique": c["unique"] || contains(single_unique, lname),
+        "auto_increment": c["auto_increment"],
+        "references": if (is_empty(my_refs)): None else: first(my_refs),
+        "comment": cmt
+      };)
+  | {
+    "name": tbl["name"],
+    "comment": tbl["comment"],
+    "columns": columns,
+    "primary_key": map(filter(columns, ->(c): c["primary_key"];), ->(c): c["name"];),
+    "foreign_keys": fks,
+    "unique": uniques
+  }
+end
+
+# Parses SQL DDL text and returns an array of tables:
+# {name, comment, columns: [{name, type, nullable, default, primary_key, unique,
+# auto_increment, references, comment}], primary_key, foreign_keys, unique}.
+# Only CREATE TABLE, ALTER TABLE and COMMENT ON statements are parsed; the rest are skipped.
+def sql_parse(input):
+  let src = to_string(input)
+  | let stmt_nodes = map(filter(_sql_split_statements(_sql_lex(src)), ->(st): _sql_is_schema_stmt(st);),
+    ->(st): _sql_parse_statement(src, st);)
+  | let tables = filter(stmt_nodes, ->(n): n["type"] == "create_table" && is_none(n["as"]);)
+  | let extras = flatten(map(stmt_nodes, ->(n): _sql_extras(n);))
+  | map(tables, ->(t): _sql_finalize(fold(extras, set(t, "col_comments", dict()), ->(acc, x): _sql_apply_extra(acc, x);));)
+end
+
+def _sql_cell(v):
+  if (is_none(v) || v == ""):
+    ""
+  else:
+    replace(replace(to_string(v), "|", "\\|"), "\n", " ")
+end
+
+def _sql_code_cell(v):
+  if (is_none(v) || v == ""): "" else: "`" + _sql_cell(v) + "`"
+end
+
+def _sql_key_cell(c):
+  let parts = (if (c["primary_key"]): ["PK"] else: [])
+     + (if (c["unique"]): ["UK"] else: [])
+     + (if (is_none(c["references"])): [] else: ["FK: " + c["references"]])
+  | join(parts, ", ")
+end
+
+# Renders one table from sql_parse as a Markdown section.
+def sql_table_to_markdown(tbl):
+  let header = "## " + tbl["name"]
+  | let comment = if (is_none(tbl["comment"]) || tbl["comment"] == ""): "" else: "\n\n" + tbl["comment"]
+  | let rows = map(tbl["columns"], ->(c):
+      "| " + join([
+        _sql_code_cell(c["name"]),
+        _sql_code_cell(c["type"]),
+        if (c["nullable"]): "YES" else: "NO",
+        _sql_code_cell(c["default"]),
+        _sql_cell(_sql_key_cell(c)),
+        _sql_cell(c["comment"])
+      ], " | ") + " |";)
+  | header + comment + "\n\n"
+   + "| Column | Type | Null | Default | Key | Comment |\n"
+   + "|---|---|---|---|---|---|"
+   + (if (is_empty(rows)): "" else: "\n" + join(rows, "\n"))
+end
+
+# Parses SQL DDL text and renders each table as a Markdown section.
+def sql_to_markdown(input):
+  join(map(sql_parse(input), ->(t): sql_table_to_markdown(t);), "\n\n")
+end
+def sql_to_markdown(input):
+  join(map(sql_parse(input), ->(t): sql_table_to_markdown(t);), "\n\n")
+end
+

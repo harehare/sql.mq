@@ -1,0 +1,2128 @@
+include "test"
+| include "sql"
+|
+
+def _t(sql, name):
+  first(filter(sql_parse(sql), ->(t): t["name"] == name;))
+end
+
+def _c(tbl, name):
+  first(filter(tbl["columns"], ->(c): c["name"] == name;))
+end
+
+# -- Columns --
+
+def test_parse_basic_columns():
+  let t = _t("CREATE TABLE a (id INT, name TEXT);", "a")
+  | assert_eq(map(t["columns"], ->(c): c["name"];), ["id", "name"])
+  | assert_eq(_c(t, "id")["type"], "INT")
+end
+
+def test_parse_type_with_precision():
+  let t = _t("CREATE TABLE a (price DECIMAL(10, 2) NOT NULL);", "a")
+  | assert_eq(_c(t, "price")["type"], "DECIMAL(10, 2)")
+  | assert_eq(_c(t, "price")["nullable"], false)
+end
+
+def test_parse_multiword_type():
+  let t = _t("CREATE TABLE a (at TIMESTAMP WITH TIME ZONE DEFAULT now(), c CHARACTER VARYING(5));", "a")
+  | assert_eq(_c(t, "at")["type"], "TIMESTAMP WITH TIME ZONE")
+  | assert_eq(_c(t, "c")["type"], "CHARACTER VARYING(5)")
+end
+
+def test_parse_defaults():
+  let t = _t("CREATE TABLE a (x TEXT DEFAULT 'a, b', y INT DEFAULT -1, z TEXT DEFAULT 'q'::text, w INT NOT NULL);", "a")
+  | assert_eq(_c(t, "x")["default"], "'a, b'")
+  | assert_eq(_c(t, "y")["default"], "-1")
+  | assert_eq(_c(t, "z")["default"], "'q'::text")
+  | assert_eq(_c(t, "w")["default"], None)
+end
+
+def test_parse_inline_primary_key_and_unique():
+  let t = _t("CREATE TABLE a (id INT PRIMARY KEY, email TEXT UNIQUE);", "a")
+  | assert_eq(_c(t, "id")["primary_key"], true)
+  | assert_eq(_c(t, "id")["nullable"], false)
+  | assert_eq(_c(t, "email")["unique"], true)
+  | assert_eq(t["primary_key"], ["id"])
+end
+
+def test_parse_auto_increment_and_comment():
+  let t = _t("CREATE TABLE a (id INT AUTO_INCREMENT COMMENT 'the id');", "a")
+  | assert_eq(_c(t, "id")["auto_increment"], true)
+  | assert_eq(_c(t, "id")["comment"], "the id")
+end
+
+def test_quoted_identifiers():
+  let t = _t("CREATE TABLE `my tbl` (\"a b\" INT, [c] INT);", "my tbl")
+  | assert_eq(map(t["columns"], ->(c): c["name"];), ["a b", "c"])
+end
+
+# -- Table constraints --
+
+def test_table_level_primary_key():
+  let t = _t("CREATE TABLE a (x INT, y INT, CONSTRAINT pk PRIMARY KEY (x, y));", "a")
+  | assert_eq(t["primary_key"], ["x", "y"])
+  | assert_eq(_c(t, "x")["nullable"], false)
+end
+
+def test_table_level_unique():
+  let t = _t("CREATE TABLE a (x INT, y INT, UNIQUE (x), UNIQUE (x, y));", "a")
+  | assert_eq(_c(t, "x")["unique"], true)
+  | assert_eq(_c(t, "y")["unique"], false)
+  | assert_eq(t["unique"], [["x"], ["x", "y"]])
+end
+
+def test_inline_references():
+  let t = _t("CREATE TABLE a (uid INT REFERENCES users (id) ON DELETE CASCADE);", "a")
+  | assert_eq(_c(t, "uid")["references"], "users.id")
+  | assert_eq(t["foreign_keys"], [{"columns": ["uid"], "ref_table": "users", "ref_columns": ["id"]}])
+end
+
+def test_table_level_foreign_key():
+  let t = _t("CREATE TABLE a (uid INT, FOREIGN KEY (uid) REFERENCES s.users (id));", "a")
+  | assert_eq(_c(t, "uid")["references"], "s.users.id")
+end
+
+def test_mysql_key_is_ignored_but_key_column_is_kept():
+  let t = _t("CREATE TABLE a (id INT, KEY idx (id), `key` VARCHAR(10));", "a")
+  | assert_eq(map(t["columns"], ->(c): c["name"];), ["id", "key"])
+end
+
+# -- Statements --
+
+def test_multiple_tables_and_comments_in_sql():
+  let r = sql_parse("-- c\nCREATE TABLE a (x INT); /* b */ CREATE TABLE b (y INT);")
+  | assert_eq(map(r, ->(t): t["name"];), ["a", "b"])
+end
+
+def test_non_ddl_statements_are_ignored():
+  let r = sql_parse("INSERT INTO a VALUES (1); CREATE INDEX i ON a (x); DROP TABLE b;")
+  | assert_eq(r, [])
+end
+
+def test_create_if_not_exists_and_schema():
+  let r = sql_parse("CREATE TEMPORARY TABLE IF NOT EXISTS public.a (x INT);")
+  | assert_eq(first(r)["name"], "public.a")
+end
+
+def test_alter_table_add_constraints():
+  let t = _t("CREATE TABLE a (id INT, uid INT); ALTER TABLE ONLY a ADD CONSTRAINT a_pkey PRIMARY KEY (id); ALTER TABLE ONLY a ADD CONSTRAINT fk FOREIGN KEY (uid) REFERENCES u (id);", "a")
+  | assert_eq(t["primary_key"], ["id"])
+  | assert_eq(_c(t, "uid")["references"], "u.id")
+end
+
+def test_comment_on_statements():
+  let t = _t("CREATE TABLE a (x INT); COMMENT ON TABLE a IS 'tbl'; COMMENT ON COLUMN a.x IS 'col';", "a")
+  | assert_eq(t["comment"], "tbl")
+  | assert_eq(_c(t, "x")["comment"], "col")
+end
+
+def test_mysql_table_comment():
+  let t = _t("CREATE TABLE a (x INT) ENGINE=InnoDB COMMENT='hello';", "a")
+  | assert_eq(t["comment"], "hello")
+end
+
+def test_unbalanced_parentheses_is_an_error():
+  assert_eq(try: sql_parse("CREATE TABLE a (x INT") catch: "error", "error")
+end
+
+# -- Markdown --
+
+def test_markdown_output():
+  let md = sql_to_markdown("CREATE TABLE a (id INT PRIMARY KEY, n TEXT DEFAULT 'x|y' COMMENT 'p|q'); COMMENT ON TABLE a IS 'Tbl';")
+  | assert_eq(md, "## a\n\nTbl\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `id` | `INT` | NO |  | PK |  |\n| `n` | `TEXT` | YES | `'x\\|y'` |  | p\\|q |")
+end
+
+def test_markdown_empty_input():
+  assert_eq(sql_to_markdown("SELECT 1;"), "")
+end
+
+# -- AST: expressions --
+
+def _expr(sql):
+  first(first(sql_ast("SELECT " + sql))["columns"])["expr"]
+end
+
+def _p(sql):
+  sql_stringify(sql_ast(sql))
+end
+
+def test_ast_precedence_and_over_or():
+  let e = _expr("a OR b AND c")
+  | assert_eq(e["op"], "OR")
+  | assert_eq(e["right"]["op"], "AND")
+end
+
+def test_ast_arithmetic_precedence():
+  let e = _expr("1 + 2 * 3")
+  | assert_eq(e["op"], "+")
+  | assert_eq(e["right"]["op"], "*")
+end
+
+def test_ast_literals():
+  assert_eq(_expr("'it''s'"), {"type": "literal", "kind": "string", "value": "it's"})
+  | assert_eq(_expr("1.5e3")["value"], "1.5e3")
+  | assert_eq(_expr("NULL")["kind"], "null")
+  | assert_eq(_expr("TRUE")["value"], true)
+end
+
+def test_ast_qualified_ident_and_star():
+  assert_eq(_expr("s.t.c")["parts"], ["s", "t", "c"])
+  | assert_eq(_expr("t.*")["table"], "t")
+  | assert_eq(_expr("t.*")["type"], "star")
+end
+
+def test_ast_function_call_variants():
+  let c = _expr("count(DISTINCT x)")
+  | assert_eq(c["name"], "count")
+  | assert_eq(c["distinct"], true)
+  | assert_eq(_expr("count(*)")["args"], [{"type": "star", "table": None}])
+end
+
+def test_ast_window_function():
+  let c = _expr("row_number() OVER (PARTITION BY a ORDER BY b DESC)")
+  | assert_eq(len(c["over"]["partition_by"]), 1)
+  | assert_eq(first(c["over"]["order_by"])["direction"], "DESC")
+end
+
+def test_ast_case_cast_between_in():
+  assert_eq(len(_expr("CASE WHEN a THEN 1 WHEN b THEN 2 ELSE 3 END")["whens"]), 2)
+  | assert_eq(_expr("x::int")["data_type"], "int")
+  | assert_eq(_expr("CAST(x AS DECIMAL(10, 2))")["data_type"], "DECIMAL(10, 2)")
+  | assert_eq(_expr("a NOT BETWEEN 1 AND 2")["negated"], true)
+  | assert_eq(len(_expr("a IN (1, 2, 3)")["values"]), 3)
+  | assert_eq(_expr("a IS NOT NULL")["what"], "NULL")
+end
+
+def test_ast_params():
+  assert_eq(_expr("$1")["value"], "$1")
+  | assert_eq(_expr(":name")["value"], ":name")
+  | assert_eq(_expr("?")["value"], "?")
+end
+
+# -- AST: queries --
+
+def _sel(sql):
+  first(sql_ast(sql))
+end
+
+def test_ast_select_clauses():
+  let q = _sel("SELECT DISTINCT a AS x, b FROM t WHERE a > 1 GROUP BY a, b HAVING count(*) > 1 ORDER BY a DESC LIMIT 5 OFFSET 2")
+  | assert_eq(q["type"], "select")
+  | assert_eq(q["distinct"], true)
+  | assert_eq(first(q["columns"])["alias"], "x")
+  | assert_eq(len(q["group_by"]), 2)
+  | assert_eq(q["limit"]["value"], "5")
+  | assert_eq(q["offset"]["value"], "2")
+end
+
+def test_ast_joins():
+  let q = _sel("SELECT * FROM a LEFT JOIN b ON a.id = b.id JOIN c USING (id)")
+  | let j = first(q["from"])
+  | assert_eq(j["type"], "join")
+  | assert_eq(j["kind"], "INNER")
+  | assert_eq(j["using"], ["id"])
+  | assert_eq(j["left"]["kind"], "LEFT")
+end
+
+def test_ast_subquery_and_alias():
+  let q = _sel("SELECT * FROM (SELECT 1) s, t AS u")
+  | assert_eq(first(q["from"])["alias"], "s")
+  | assert_eq(q["from"][1]["alias"], "u")
+end
+
+def test_ast_cte_and_set_ops():
+  let q = _sel("WITH c AS (SELECT 1) SELECT * FROM c UNION ALL SELECT 2 ORDER BY 1")
+  | assert_eq(q["type"], "set_op")
+  | assert_eq(q["all"], true)
+  | assert_eq(first(q["with"])["name"], "c")
+  | assert_eq(len(q["order_by"]), 1)
+end
+
+def test_ast_mysql_limit_offset():
+  let q = _sel("SELECT * FROM t LIMIT 5, 10")
+  | assert_eq(q["offset"]["value"], "5")
+  | assert_eq(q["limit"]["value"], "10")
+end
+
+# -- AST: DML --
+
+def test_ast_insert_values():
+  let q = _sel("INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y') RETURNING a")
+  | assert_eq(q["table"], "t")
+  | assert_eq(q["columns"], ["a", "b"])
+  | assert_eq(len(q["source"]["rows"]), 2)
+  | assert_eq(len(q["returning"]), 1)
+end
+
+def test_ast_insert_on_conflict():
+  let q = _sel("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2")
+  | assert_eq(q["on_conflict"]["target"], ["a"])
+  | assert_eq(first(q["on_conflict"]["set"])["column"], "a")
+end
+
+def test_ast_update_and_delete():
+  let u = _sel("UPDATE t SET a = 1, b = 2 WHERE id = 3")
+  | assert_eq(map(u["set"], ->(x): x["column"];), ["a", "b"])
+  | assert_eq(u["where"]["op"], "=")
+  | let d = _sel("DELETE FROM t WHERE id = 3")
+  | assert_eq(d["table"], "t")
+end
+
+# -- AST: DDL --
+
+def test_ast_create_table_node():
+  let t = _sel("CREATE TABLE a (id INT PRIMARY KEY, n TEXT DEFAULT 'x' NOT NULL, CHECK (id > 0))")
+  | assert_eq(t["type"], "create_table")
+  | assert_eq(first(t["columns"])["primary_key"], true)
+  | assert_eq(t["columns"][1]["default"]["value"], "x")
+  | assert_eq(first(t["constraints"])["kind"], "check")
+end
+
+def test_ast_create_index_view_drop():
+  assert_eq(_sel("CREATE UNIQUE INDEX i ON t (a, b DESC)")["unique"], true)
+  | assert_eq(_sel("CREATE VIEW v AS SELECT 1")["query"]["type"], "select")
+  | assert_eq(_sel("DROP TABLE IF EXISTS a, b")["names"], ["a", "b"])
+end
+
+def test_ast_alter_table_actions():
+  let a = _sel("ALTER TABLE t ADD COLUMN c INT, DROP COLUMN d")
+  | assert_eq(map(a["actions"], ->(x): x["action"];), ["add_column", "drop_column"])
+end
+
+def test_ast_unknown_statement():
+  let u = _sel("GRANT SELECT ON t TO bob")
+  | assert_eq(u["type"], "unknown")
+  | assert_eq(u["sql"], "GRANT SELECT ON t TO bob")
+end
+
+# -- AST: errors and helpers --
+
+def test_ast_syntax_error():
+  assert_eq(try: sql_ast("SELECT FROM t") catch: "error", "error")
+  | assert_eq(try: sql_ast("SELECT a FROM t WHERE") catch: "error", "error")
+end
+
+def test_ast_trailing_tokens_error():
+  assert_eq(try: sql_ast("SELECT 1 2 3") catch: "error", "error")
+end
+
+def test_sql_find_collects_nested_nodes():
+  let ast = sql_ast("SELECT a FROM t JOIN u ON t.id = u.id WHERE x IN (SELECT y FROM v)")
+  | assert_eq(map(sql_find(ast, "table"), ->(t): t["name"];), ["t", "u", "v"])
+end
+
+# -- Printer --
+
+def test_stringify_round_trips():
+  let qs = [
+    "SELECT a, b AS c FROM t WHERE a = 1 AND (b > 2 OR c IS NULL) ORDER BY a DESC LIMIT 10",
+    "SELECT * FROM a LEFT JOIN b ON a.id = b.id, c WHERE x IN (SELECT y FROM z)",
+    "WITH r AS (SELECT 1) SELECT * FROM r UNION ALL SELECT 2",
+    "INSERT INTO t (a) VALUES (1), (2) ON CONFLICT (a) DO NOTHING",
+    "UPDATE t SET a = a + 1 WHERE id = 1",
+    "DELETE FROM t WHERE id = 1",
+    "SELECT CASE WHEN a THEN 1 ELSE 2 END, CAST(x AS int), y::text, count(DISTINCT z) FROM t",
+    "CREATE UNIQUE INDEX i ON t (a, b DESC)",
+    "DROP TABLE IF EXISTS a CASCADE"
+  ]
+  | assert_eq(map(qs, ->(q): sql_stringify(sql_ast(q)[0]);), qs)
+end
+
+def test_stringify_adds_required_parentheses():
+  assert_eq(_p("SELECT (a + b) * c, a - (b - c), (a OR b) AND c"), "SELECT (a + b) * c, a - (b - c), (a OR b) AND c;")
+  | assert_eq(_p("SELECT a + b * c, (a * b) + c"), "SELECT a + b * c, (a * b) + c;")
+end
+
+def test_stringify_quotes_identifiers_when_needed():
+  assert_eq(_p("SELECT \"my col\", \"select\" FROM \"my tbl\""), "SELECT \"my col\", \"select\" FROM \"my tbl\";")
+end
+
+def test_stringify_statement_array():
+  assert_eq(sql_stringify(sql_ast("SELECT 1; SELECT 2")), "SELECT 1;\nSELECT 2;")
+end
+
+def test_stringify_ast_edited_by_hand():
+  let q = first(sql_ast("SELECT a FROM t"))
+  | let edited = set(q, "where", {"type": "binary", "op": "=", "left": {"type": "ident", "parts": ["id"]}, "right": {"type": "literal", "kind": "number", "value": "1"}})
+  | assert_eq(sql_stringify(edited), "SELECT a FROM t WHERE id = 1")
+end
+
+# ===========================================================================
+# Parameterized tests
+# ===========================================================================
+
+def _path(node, path):
+  fold(path, node, ->(acc, k): acc[k];)
+end
+
+def _names(items, field):
+  map(items, ->(n): n[field];)
+end
+
+# Printer: each input prints as its canonical form
+# @parametrize([
+#   ["SELECT 1", "SELECT 1"],
+#   ["select 1 as one", "SELECT 1 AS one"],
+#   ["SELECT 1.5, .5, 1e3, 0xFF, 'a', NULL, TRUE, false", "SELECT 1.5, .5, 1e3, 0xFF, 'a', NULL, TRUE, FALSE"],
+#   ["SELECT 'it''s'", "SELECT 'it''s'"],
+#   ["SELECT \"Col\", `col2`, [col3] FROM \"T\"", "SELECT \"Col\", `col2`, [col3] FROM \"T\""],
+#   ["SELECT a.b.c FROM s.t", "SELECT a.b.c FROM s.t"],
+#   ["SELECT t.* FROM t", "SELECT t.* FROM t"],
+#   ["SELECT * FROM t AS x", "SELECT * FROM t AS x"],
+#   ["SELECT * FROM t x", "SELECT * FROM t AS x"],
+#   ["SELECT DISTINCT a FROM t", "SELECT DISTINCT a FROM t"],
+#   ["SELECT ALL a FROM t", "SELECT ALL a FROM t"],
+#   ["SELECT DISTINCT ON (a, b) a FROM t", "SELECT DISTINCT ON (a, b) a FROM t"],
+#   ["SELECT a AS \"x y\" FROM t", "SELECT a AS \"x y\" FROM t"],
+#   ["SELECT a + b * c - d / e % f", "SELECT a + b * c - d / e % f"],
+#   ["SELECT (a + b) * c", "SELECT (a + b) * c"],
+#   ["SELECT a - (b - c)", "SELECT a - (b - c)"],
+#   ["SELECT a - b - c", "SELECT a - b - c"],
+#   ["SELECT -a, +a, -(a + b)", "SELECT -a, +a, -(a + b)"],
+#   ["SELECT 2 ^ 3 ^ 4", "SELECT 2 ^ 3 ^ 4"],
+#   ["SELECT a || b || c", "SELECT a || b || c"],
+#   ["SELECT a -> 'k' ->> 'j'", "SELECT a -> 'k' ->> 'j'"],
+#   ["SELECT a = 1 AND b <> 2 OR c != 3", "SELECT a = 1 AND b <> 2 OR c != 3"],
+#   ["SELECT a < 1, a <= 1, a > 1, a >= 1", "SELECT a < 1, a <= 1, a > 1, a >= 1"],
+#   ["SELECT a OR b AND c", "SELECT a OR b AND c"],
+#   ["SELECT (a OR b) AND c", "SELECT (a OR b) AND c"],
+#   ["SELECT NOT a AND b", "SELECT NOT a AND b"],
+#   ["SELECT NOT (a AND b)", "SELECT NOT (a AND b)"],
+#   ["SELECT NOT a = b", "SELECT NOT a = b"],
+#   ["SELECT a IS NULL, a IS NOT NULL, a IS TRUE, a IS NOT FALSE, a IS UNKNOWN", "SELECT a IS NULL, a IS NOT NULL, a IS TRUE, a IS NOT FALSE, a IS UNKNOWN"],
+#   ["SELECT a IS DISTINCT FROM b, a IS NOT DISTINCT FROM b", "SELECT a IS DISTINCT FROM b, a IS NOT DISTINCT FROM b"],
+#   ["SELECT a BETWEEN 1 AND 2 AND c", "SELECT a BETWEEN 1 AND 2 AND c"],
+#   ["SELECT a NOT BETWEEN 1 + 1 AND 2 * 2", "SELECT a NOT BETWEEN 1 + 1 AND 2 * 2"],
+#   ["SELECT a IN (1, 2, 3), a NOT IN (1)", "SELECT a IN (1, 2, 3), a NOT IN (1)"],
+#   ["SELECT a IN (SELECT b FROM t)", "SELECT a IN (SELECT b FROM t)"],
+#   ["SELECT a LIKE 'x%', a NOT LIKE 'x%', a ILIKE 'x', a NOT ILIKE 'y', a SIMILAR TO 'z'", "SELECT a LIKE 'x%', a NOT LIKE 'x%', a ILIKE 'x', a NOT ILIKE 'y', a SIMILAR TO 'z'"],
+#   ["SELECT a LIKE 'x!%' ESCAPE '!'", "SELECT a LIKE 'x!%' ESCAPE '!'"],
+#   ["SELECT CASE WHEN a THEN 1 END", "SELECT CASE WHEN a THEN 1 END"],
+#   ["SELECT CASE a WHEN 1 THEN 'x' WHEN 2 THEN 'y' ELSE 'z' END", "SELECT CASE a WHEN 1 THEN 'x' WHEN 2 THEN 'y' ELSE 'z' END"],
+#   ["SELECT CAST(a AS int), CAST(a AS DECIMAL(10, 2)), CAST(a AS timestamp with time zone)", "SELECT CAST(a AS int), CAST(a AS DECIMAL(10, 2)), CAST(a AS timestamp with time zone)"],
+#   ["SELECT a::int, a::varchar(10), a::int[], a::double precision, 'x'::text::int", "SELECT a::int, a::varchar(10), a::int[], a::double precision, 'x'::text::int"],
+#   ["SELECT -a::int", "SELECT -a::int"],
+#   ["SELECT (-a)::int", "SELECT (-a)::int"],
+#   ["SELECT EXISTS (SELECT 1), NOT EXISTS (SELECT 1 FROM t)", "SELECT EXISTS (SELECT 1), NOT EXISTS (SELECT 1 FROM t)"],
+#   ["SELECT (SELECT max(a) FROM t) AS m", "SELECT (SELECT max(a) FROM t) AS m"],
+#   ["SELECT (1, 2), (a, b) = (1, 2)", "SELECT (1, 2), (a, b) = (1, 2)"],
+#   ["SELECT DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00', TIME '10:00', INTERVAL '1' DAY", "SELECT DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00', TIME '10:00', INTERVAL '1' DAY"],
+#   ["SELECT now(), count(*), count(DISTINCT a), coalesce(a, b, 0)", "SELECT now(), count(*), count(DISTINCT a), coalesce(a, b, 0)"],
+#   ["SELECT s.f(1)", "SELECT s.f(1)"],
+#   ["SELECT extract(year FROM d), substring(a FROM 1 FOR 2), position('a' IN b), trim(BOTH 'x' FROM y)", "SELECT extract(year FROM d), substring(a FROM 1 FOR 2), position('a' IN b), trim(BOTH 'x' FROM y)"],
+#   ["SELECT left(a, 2), right(a, 2)", "SELECT left(a, 2), right(a, 2)"],
+#   ["SELECT $1, $2, ?, :name, @var", "SELECT $1, $2, ?, :name, @var"],
+#   ["SELECT sum(a) FILTER (WHERE b > 1)", "SELECT sum(a) FILTER (WHERE b > 1)"],
+#   ["SELECT row_number() OVER (), rank() OVER (ORDER BY a DESC NULLS FIRST)", "SELECT row_number() OVER (), rank() OVER (ORDER BY a DESC NULLS FIRST)"],
+#   ["SELECT sum(a) OVER (PARTITION BY b, c ORDER BY d ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)", "SELECT sum(a) OVER (PARTITION BY b, c ORDER BY d ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"],
+#   ["SELECT sum(a) OVER w FROM t WINDOW w AS (PARTITION BY b)", "SELECT sum(a) OVER w FROM t WINDOW w AS (PARTITION BY b)"],
+#   ["SELECT a FROM t WINDOW w AS (ORDER BY a), v AS (w ROWS UNBOUNDED PRECEDING)", "SELECT a FROM t WINDOW w AS (ORDER BY a), v AS (w ROWS UNBOUNDED PRECEDING)"],
+#   ["SELECT * FROM a JOIN b ON a.id = b.id", "SELECT * FROM a JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a INNER JOIN b USING (id)", "SELECT * FROM a INNER JOIN b USING (id)"],
+#   ["SELECT * FROM a LEFT JOIN b ON a.id = b.id", "SELECT * FROM a LEFT JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.id", "SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a RIGHT JOIN b ON a.id = b.id", "SELECT * FROM a RIGHT JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id", "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a CROSS JOIN b", "SELECT * FROM a CROSS JOIN b"],
+#   ["SELECT * FROM a NATURAL JOIN b", "SELECT * FROM a NATURAL JOIN b"],
+#   ["SELECT * FROM a, b, c", "SELECT * FROM a, b, c"],
+#   ["SELECT * FROM a JOIN b ON a.x = b.x JOIN c ON b.y = c.y", "SELECT * FROM a JOIN b ON a.x = b.x JOIN c ON b.y = c.y"],
+#   ["SELECT * FROM a JOIN (b JOIN c ON b.y = c.y) ON a.x = b.x", "SELECT * FROM a JOIN (b JOIN c ON b.y = c.y) ON a.x = b.x"],
+#   ["SELECT * FROM (SELECT 1) AS s", "SELECT * FROM (SELECT 1) AS s"],
+#   ["SELECT * FROM (SELECT 1) s (x)", "SELECT * FROM (SELECT 1) AS s (x)"],
+#   ["SELECT * FROM generate_series(1, 3) AS g", "SELECT * FROM generate_series(1, 3) AS g"],
+#   ["SELECT * FROM a, LATERAL (SELECT * FROM b WHERE b.x = a.x) l", "SELECT * FROM a, LATERAL (SELECT * FROM b WHERE b.x = a.x) AS l"],
+#   ["SELECT a FROM t WHERE a = 1", "SELECT a FROM t WHERE a = 1"],
+#   ["SELECT a FROM t GROUP BY a HAVING count(*) > 1", "SELECT a FROM t GROUP BY a HAVING count(*) > 1"],
+#   ["SELECT a FROM t GROUP BY ROLLUP (a, b)", "SELECT a FROM t GROUP BY ROLLUP(a, b)"],
+#   ["SELECT a FROM t GROUP BY GROUPING SETS ((a), (b, c))", "SELECT a FROM t GROUP BY GROUPING SETS((a), (b, c))"],
+#   ["SELECT a FROM t ORDER BY a", "SELECT a FROM t ORDER BY a"],
+#   ["SELECT a FROM t ORDER BY a ASC, b DESC, c DESC NULLS LAST, d NULLS FIRST", "SELECT a FROM t ORDER BY a ASC, b DESC, c DESC NULLS LAST, d NULLS FIRST"],
+#   ["SELECT a FROM t LIMIT 10", "SELECT a FROM t LIMIT 10"],
+#   ["SELECT a FROM t LIMIT 10 OFFSET 5", "SELECT a FROM t LIMIT 10 OFFSET 5"],
+#   ["SELECT a FROM t OFFSET 5 LIMIT 10", "SELECT a FROM t LIMIT 10 OFFSET 5"],
+#   ["SELECT a FROM t LIMIT 5, 10", "SELECT a FROM t LIMIT 10 OFFSET 5"],
+#   ["SELECT a FROM t LIMIT ALL", "SELECT a FROM t LIMIT ALL"],
+#   ["SELECT a FROM t OFFSET 5 ROWS", "SELECT a FROM t OFFSET 5 ROWS"],
+#   ["SELECT a FROM t FETCH FIRST 10 ROWS ONLY", "SELECT a FROM t FETCH FIRST 10 ROWS ONLY"],
+#   ["SELECT a FROM t FETCH NEXT 3 ROWS WITH TIES", "SELECT a FROM t FETCH NEXT 3 ROWS WITH TIES"],
+#   ["SELECT a FROM t FOR UPDATE", "SELECT a FROM t FOR UPDATE"],
+#   ["SELECT a FROM t FOR SHARE", "SELECT a FROM t FOR SHARE"],
+#   ["SELECT a FROM t FOR NO KEY UPDATE", "SELECT a FROM t FOR NO KEY UPDATE"],
+#   ["SELECT a FROM t FOR KEY SHARE", "SELECT a FROM t FOR KEY SHARE"],
+#   ["SELECT a FROM t FOR UPDATE NOWAIT", "SELECT a FROM t FOR UPDATE NOWAIT"],
+#   ["SELECT a FROM t FOR UPDATE SKIP LOCKED", "SELECT a FROM t FOR UPDATE SKIP LOCKED"],
+#   ["SELECT a FROM t FOR UPDATE OF t", "SELECT a FROM t FOR UPDATE OF t"],
+#   ["SELECT a FROM t, u FOR UPDATE OF t, u SKIP LOCKED", "SELECT a FROM t, u FOR UPDATE OF t, u SKIP LOCKED"],
+#   ["SELECT a FROM t FOR SHARE OF t FOR UPDATE OF u", "SELECT a FROM t FOR SHARE OF t FOR UPDATE OF u"],
+#   ["SELECT a FROM t ORDER BY a LIMIT 1 FOR UPDATE", "SELECT a FROM t ORDER BY a LIMIT 1 FOR UPDATE"],
+#   ["WITH c AS (SELECT 1) SELECT * FROM c", "WITH c AS (SELECT 1) SELECT * FROM c"],
+#   ["WITH c (x) AS (SELECT 1) SELECT x FROM c", "WITH c (x) AS (SELECT 1) SELECT x FROM c"],
+#   ["WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b", "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b"],
+#   ["WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r", "WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r"],
+#   ["WITH c AS MATERIALIZED (SELECT 1) SELECT * FROM c", "WITH c AS MATERIALIZED (SELECT 1) SELECT * FROM c"],
+#   ["SELECT 1 UNION SELECT 2", "SELECT 1 UNION SELECT 2"],
+#   ["SELECT 1 UNION ALL SELECT 2", "SELECT 1 UNION ALL SELECT 2"],
+#   ["SELECT 1 INTERSECT SELECT 2", "SELECT 1 INTERSECT SELECT 2"],
+#   ["SELECT 1 EXCEPT SELECT 2", "SELECT 1 EXCEPT SELECT 2"],
+#   ["SELECT 1 UNION SELECT 2 UNION SELECT 3", "SELECT 1 UNION SELECT 2 UNION SELECT 3"],
+#   ["SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 1", "SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 1"],
+#   ["(SELECT 1 ORDER BY 1 LIMIT 1) UNION (SELECT 2)", "(SELECT 1 ORDER BY 1 LIMIT 1) UNION (SELECT 2)"],
+#   ["VALUES (1, 'a'), (2, 'b')", "VALUES (1, 'a'), (2, 'b')"],
+#   ["SELECT * FROM (VALUES (1), (2)) AS v (n)", "SELECT * FROM (VALUES (1), (2)) AS v (n)"],
+#   ["INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (1)"],
+#   ["INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')", "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')"],
+#   ["INSERT INTO t (a) SELECT b FROM u", "INSERT INTO t (a) SELECT b FROM u"],
+#   ["INSERT INTO t DEFAULT VALUES", "INSERT INTO t DEFAULT VALUES"],
+#   ["INSERT INTO s.t (a) VALUES (DEFAULT)", "INSERT INTO s.t (a) VALUES (DEFAULT)"],
+#   ["INSERT OR REPLACE INTO t (a) VALUES (1)", "INSERT OR REPLACE INTO t (a) VALUES (1)"],
+#   ["INSERT IGNORE INTO t (a) VALUES (1)", "INSERT IGNORE INTO t (a) VALUES (1)"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING", "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING", "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = excluded.a", "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = excluded.a"],
+#   ["INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 3 WHERE t.a > 0", "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 3 WHERE t.a > 0"],
+#   ["INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = a + 1, b = 2", "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = a + 1, b = 2"],
+#   ["INSERT INTO t (a) VALUES (1) RETURNING a, b AS c", "INSERT INTO t (a) VALUES (1) RETURNING a, b AS c"],
+#   ["INSERT INTO t (a) VALUES (1) RETURNING *", "INSERT INTO t (a) VALUES (1) RETURNING *"],
+#   ["UPDATE t SET a = 1", "UPDATE t SET a = 1"],
+#   ["UPDATE t SET a = 1, b = b + 1 WHERE id = 2", "UPDATE t SET a = 1, b = b + 1 WHERE id = 2"],
+#   ["UPDATE t AS x SET a = 1 FROM u WHERE x.id = u.id", "UPDATE t AS x SET a = 1 FROM u WHERE x.id = u.id"],
+#   ["UPDATE ONLY t SET a = 1 RETURNING a", "UPDATE ONLY t SET a = 1 RETURNING a"],
+#   ["UPDATE s.t SET s.t.a = 1", "UPDATE s.t SET s.t.a = 1"],
+#   ["DELETE FROM t", "DELETE FROM t"],
+#   ["DELETE FROM t WHERE id = 1", "DELETE FROM t WHERE id = 1"],
+#   ["DELETE FROM t AS x USING u WHERE x.id = u.id", "DELETE FROM t AS x USING u WHERE x.id = u.id"],
+#   ["DELETE FROM ONLY t WHERE a IN (1, 2) RETURNING *", "DELETE FROM ONLY t WHERE a IN (1, 2) RETURNING *"],
+#   ["CREATE TABLE a (id INT)", "CREATE TABLE a (\n  id INT\n)"],
+#   ["CREATE TEMPORARY TABLE IF NOT EXISTS a (id INT)", "CREATE TEMPORARY TABLE IF NOT EXISTS a (\n  id INT\n)"],
+#   ["CREATE TABLE a (id INT PRIMARY KEY, n TEXT NOT NULL)", "CREATE TABLE a (\n  id INT PRIMARY KEY,\n  n TEXT NOT NULL\n)"],
+#   ["CREATE TABLE a (id INT NOT NULL DEFAULT 0, n TEXT DEFAULT 'x', t TIMESTAMP DEFAULT now())", "CREATE TABLE a (\n  id INT NOT NULL DEFAULT 0,\n  n TEXT DEFAULT 'x',\n  t TIMESTAMP DEFAULT now()\n)"],
+#   ["CREATE TABLE a (id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT 'the id')", "CREATE TABLE a (\n  id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT 'the id'\n)"],
+#   ["CREATE TABLE a (u INT REFERENCES users (id) ON DELETE CASCADE ON UPDATE SET NULL)", "CREATE TABLE a (\n  u INT REFERENCES users (id) ON DELETE CASCADE ON UPDATE SET NULL\n)"],
+#   ["CREATE TABLE a (u INT REFERENCES users)", "CREATE TABLE a (\n  u INT REFERENCES users\n)"],
+#   ["CREATE TABLE a (x INT CHECK (x > 0), y INT UNIQUE)", "CREATE TABLE a (\n  x INT CHECK (x > 0),\n  y INT UNIQUE\n)"],
+#   ["CREATE TABLE a (x INT, y INT, PRIMARY KEY (x, y))", "CREATE TABLE a (\n  x INT,\n  y INT,\n  PRIMARY KEY (x, y)\n)"],
+#   ["CREATE TABLE a (x INT, CONSTRAINT pk PRIMARY KEY (x))", "CREATE TABLE a (\n  x INT,\n  CONSTRAINT pk PRIMARY KEY (x)\n)"],
+#   ["CREATE TABLE a (x INT, UNIQUE (x), CONSTRAINT u2 UNIQUE (x))", "CREATE TABLE a (\n  x INT,\n  UNIQUE (x),\n  CONSTRAINT u2 UNIQUE (x)\n)"],
+#   ["CREATE TABLE a (x INT, FOREIGN KEY (x) REFERENCES b (id))", "CREATE TABLE a (\n  x INT,\n  FOREIGN KEY (x) REFERENCES b (id)\n)"],
+#   ["CREATE TABLE a (x INT, CONSTRAINT fk FOREIGN KEY (x) REFERENCES b (id) ON DELETE NO ACTION)", "CREATE TABLE a (\n  x INT,\n  CONSTRAINT fk FOREIGN KEY (x) REFERENCES b (id) ON DELETE NO ACTION\n)"],
+#   ["CREATE TABLE a (x INT, CHECK (x > 0), CONSTRAINT c2 CHECK (x < 10))", "CREATE TABLE a (\n  x INT,\n  CHECK (x > 0),\n  CONSTRAINT c2 CHECK (x < 10)\n)"],
+#   ["CREATE TABLE a (x INT, KEY idx (x))", "CREATE TABLE a (\n  x INT,\n  KEY idx (x)\n)"],
+#   ["CREATE TABLE a (price DECIMAL(10, 2), n VARCHAR(255), t TIMESTAMP WITH TIME ZONE)", "CREATE TABLE a (\n  price DECIMAL(10, 2),\n  n VARCHAR(255),\n  t TIMESTAMP WITH TIME ZONE\n)"],
+#   ["CREATE TABLE a (id INT) COMMENT = 'tbl'", "CREATE TABLE a (\n  id INT\n) COMMENT = 'tbl'"],
+#   ["CREATE TABLE a AS SELECT * FROM b", "CREATE TABLE a AS SELECT * FROM b"],
+#   ["CREATE INDEX i ON t (a)", "CREATE INDEX i ON t (a)"],
+#   ["CREATE UNIQUE INDEX i ON t (a, b DESC)", "CREATE UNIQUE INDEX i ON t (a, b DESC)"],
+#   ["CREATE INDEX IF NOT EXISTS i ON t USING btree (lower(a))", "CREATE INDEX IF NOT EXISTS i ON t USING BTREE (lower(a))"],
+#   ["CREATE INDEX ON t (a) WHERE a > 0", "CREATE INDEX ON t (a) WHERE a > 0"],
+#   ["CREATE VIEW v AS SELECT 1", "CREATE VIEW v AS SELECT 1"],
+#   ["CREATE OR REPLACE VIEW v (a, b) AS SELECT 1, 2", "CREATE OR REPLACE VIEW v (a, b) AS SELECT 1, 2"],
+#   ["CREATE MATERIALIZED VIEW v AS SELECT 1", "CREATE MATERIALIZED VIEW v AS SELECT 1"],
+#   ["CREATE TEMPORARY VIEW IF NOT EXISTS v AS SELECT 1", "CREATE TEMPORARY VIEW IF NOT EXISTS v AS SELECT 1"],
+#   ["ALTER TABLE t ADD COLUMN c INT", "ALTER TABLE t ADD COLUMN c INT"],
+#   ["ALTER TABLE t ADD c INT NOT NULL DEFAULT 0", "ALTER TABLE t ADD COLUMN c INT NOT NULL DEFAULT 0"],
+#   ["ALTER TABLE t DROP COLUMN c", "ALTER TABLE t DROP COLUMN c"],
+#   ["ALTER TABLE t DROP CONSTRAINT c", "ALTER TABLE t DROP CONSTRAINT c"],
+#   ["ALTER TABLE t RENAME TO u", "ALTER TABLE t RENAME TO u"],
+#   ["ALTER TABLE t RENAME COLUMN a TO b", "ALTER TABLE t RENAME COLUMN a TO b"],
+#   ["ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (id)", "ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (id)"],
+#   ["ALTER TABLE ONLY t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u (id) ON DELETE CASCADE", "ALTER TABLE ONLY t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u (id) ON DELETE CASCADE"],
+#   ["ALTER TABLE t ADD UNIQUE (a)", "ALTER TABLE t ADD UNIQUE (a)"],
+#   ["ALTER TABLE t ADD COLUMN a INT, DROP COLUMN b", "ALTER TABLE t ADD COLUMN a INT, DROP COLUMN b"],
+#   ["ALTER TABLE t ALTER COLUMN a SET NOT NULL", "ALTER TABLE t ALTER COLUMN a SET NOT NULL"],
+#   ["DROP TABLE t", "DROP TABLE t"],
+#   ["DROP TABLE IF EXISTS a, b CASCADE", "DROP TABLE IF EXISTS a, b CASCADE"],
+#   ["DROP VIEW v", "DROP VIEW v"],
+#   ["DROP INDEX i ON t", "DROP INDEX i ON t"],
+#   ["DROP SCHEMA s CASCADE", "DROP SCHEMA s CASCADE"],
+#   ["TRUNCATE t", "TRUNCATE TABLE t"],
+#   ["TRUNCATE TABLE a, b", "TRUNCATE TABLE a, b"],
+#   ["COMMENT ON TABLE t IS 'x'", "COMMENT ON TABLE t IS 'x'"],
+#   ["COMMENT ON COLUMN t.c IS 'it''s'", "COMMENT ON COLUMN t.c IS 'it''s'"],
+#   ["COMMENT ON COLUMN t.c IS NULL", "COMMENT ON COLUMN t.c IS NULL"],
+#   ["GRANT SELECT ON t TO bob", "GRANT SELECT ON t TO bob"],
+#   ["SET search_path = public", "SET search_path = public"],
+#   ["BEGIN", "BEGIN"],
+#   ["SELECT /* c */ 1 -- x\n", "SELECT 1"],
+#   ["-- only comment\nSELECT 1", "SELECT 1"],
+#   ["SELECT $$a'b$$", "SELECT 'a''b'"],
+#   ["SELECT a  FROM\n\tt", "SELECT a FROM t"],
+#   ["select a from t where b = 1 order by a desc limit 1", "SELECT a FROM t WHERE b = 1 ORDER BY a DESC LIMIT 1"],
+#   ["SELECT \"my col\", \"select\" FROM \"my tbl\"", "SELECT \"my col\", \"select\" FROM \"my tbl\""],
+#   ["SELECT * FROM \"s\".\"t\"", "SELECT * FROM \"s\".\"t\""]
+# ])
+def test_stringify_canonical(sql, expected):
+  assert_eq(sql_stringify(first(sql_ast(sql))), expected)
+end
+
+# Printer: canonical forms are fixed points of parse then print
+# @parametrize([
+#   ["SELECT 1"],
+#   ["SELECT 1 AS one"],
+#   ["SELECT 1.5, .5, 1e3, 0xFF, 'a', NULL, TRUE, FALSE"],
+#   ["SELECT 'it''s'"],
+#   ["SELECT \"Col\", `col2`, [col3] FROM \"T\""],
+#   ["SELECT a.b.c FROM s.t"],
+#   ["SELECT t.* FROM t"],
+#   ["SELECT * FROM t AS x"],
+#   ["SELECT * FROM t AS x"],
+#   ["SELECT DISTINCT a FROM t"],
+#   ["SELECT ALL a FROM t"],
+#   ["SELECT DISTINCT ON (a, b) a FROM t"],
+#   ["SELECT a AS \"x y\" FROM t"],
+#   ["SELECT a + b * c - d / e % f"],
+#   ["SELECT (a + b) * c"],
+#   ["SELECT a - (b - c)"],
+#   ["SELECT a - b - c"],
+#   ["SELECT -a, +a, -(a + b)"],
+#   ["SELECT 2 ^ 3 ^ 4"],
+#   ["SELECT a || b || c"],
+#   ["SELECT a -> 'k' ->> 'j'"],
+#   ["SELECT a = 1 AND b <> 2 OR c != 3"],
+#   ["SELECT a < 1, a <= 1, a > 1, a >= 1"],
+#   ["SELECT a OR b AND c"],
+#   ["SELECT (a OR b) AND c"],
+#   ["SELECT NOT a AND b"],
+#   ["SELECT NOT (a AND b)"],
+#   ["SELECT NOT a = b"],
+#   ["SELECT a IS NULL, a IS NOT NULL, a IS TRUE, a IS NOT FALSE, a IS UNKNOWN"],
+#   ["SELECT a IS DISTINCT FROM b, a IS NOT DISTINCT FROM b"],
+#   ["SELECT a BETWEEN 1 AND 2 AND c"],
+#   ["SELECT a NOT BETWEEN 1 + 1 AND 2 * 2"],
+#   ["SELECT a IN (1, 2, 3), a NOT IN (1)"],
+#   ["SELECT a IN (SELECT b FROM t)"],
+#   ["SELECT a LIKE 'x%', a NOT LIKE 'x%', a ILIKE 'x', a NOT ILIKE 'y', a SIMILAR TO 'z'"],
+#   ["SELECT a LIKE 'x!%' ESCAPE '!'"],
+#   ["SELECT CASE WHEN a THEN 1 END"],
+#   ["SELECT CASE a WHEN 1 THEN 'x' WHEN 2 THEN 'y' ELSE 'z' END"],
+#   ["SELECT CAST(a AS int), CAST(a AS DECIMAL(10, 2)), CAST(a AS timestamp with time zone)"],
+#   ["SELECT a::int, a::varchar(10), a::int[], a::double precision, 'x'::text::int"],
+#   ["SELECT -a::int"],
+#   ["SELECT (-a)::int"],
+#   ["SELECT EXISTS (SELECT 1), NOT EXISTS (SELECT 1 FROM t)"],
+#   ["SELECT (SELECT max(a) FROM t) AS m"],
+#   ["SELECT (1, 2), (a, b) = (1, 2)"],
+#   ["SELECT DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00', TIME '10:00', INTERVAL '1' DAY"],
+#   ["SELECT now(), count(*), count(DISTINCT a), coalesce(a, b, 0)"],
+#   ["SELECT s.f(1)"],
+#   ["SELECT extract(year FROM d), substring(a FROM 1 FOR 2), position('a' IN b), trim(BOTH 'x' FROM y)"],
+#   ["SELECT left(a, 2), right(a, 2)"],
+#   ["SELECT $1, $2, ?, :name, @var"],
+#   ["SELECT sum(a) FILTER (WHERE b > 1)"],
+#   ["SELECT row_number() OVER (), rank() OVER (ORDER BY a DESC NULLS FIRST)"],
+#   ["SELECT sum(a) OVER (PARTITION BY b, c ORDER BY d ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"],
+#   ["SELECT sum(a) OVER w FROM t WINDOW w AS (PARTITION BY b)"],
+#   ["SELECT a FROM t WINDOW w AS (ORDER BY a), v AS (w ROWS UNBOUNDED PRECEDING)"],
+#   ["SELECT * FROM a JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a INNER JOIN b USING (id)"],
+#   ["SELECT * FROM a LEFT JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a RIGHT JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id"],
+#   ["SELECT * FROM a CROSS JOIN b"],
+#   ["SELECT * FROM a NATURAL JOIN b"],
+#   ["SELECT * FROM a, b, c"],
+#   ["SELECT * FROM a JOIN b ON a.x = b.x JOIN c ON b.y = c.y"],
+#   ["SELECT * FROM a JOIN (b JOIN c ON b.y = c.y) ON a.x = b.x"],
+#   ["SELECT * FROM (SELECT 1) AS s"],
+#   ["SELECT * FROM (SELECT 1) AS s (x)"],
+#   ["SELECT * FROM generate_series(1, 3) AS g"],
+#   ["SELECT * FROM a, LATERAL (SELECT * FROM b WHERE b.x = a.x) AS l"],
+#   ["SELECT a FROM t WHERE a = 1"],
+#   ["SELECT a FROM t GROUP BY a HAVING count(*) > 1"],
+#   ["SELECT a FROM t GROUP BY ROLLUP(a, b)"],
+#   ["SELECT a FROM t GROUP BY GROUPING SETS((a), (b, c))"],
+#   ["SELECT a FROM t ORDER BY a"],
+#   ["SELECT a FROM t ORDER BY a ASC, b DESC, c DESC NULLS LAST, d NULLS FIRST"],
+#   ["SELECT a FROM t LIMIT 10"],
+#   ["SELECT a FROM t LIMIT 10 OFFSET 5"],
+#   ["SELECT a FROM t LIMIT 10 OFFSET 5"],
+#   ["SELECT a FROM t LIMIT 10 OFFSET 5"],
+#   ["SELECT a FROM t LIMIT ALL"],
+#   ["SELECT a FROM t OFFSET 5 ROWS"],
+#   ["SELECT a FROM t FETCH FIRST 10 ROWS ONLY"],
+#   ["SELECT a FROM t FETCH NEXT 3 ROWS WITH TIES"],
+#   ["SELECT a FROM t FOR UPDATE"],
+#   ["SELECT a FROM t FOR SHARE"],
+#   ["SELECT a FROM t FOR NO KEY UPDATE"],
+#   ["SELECT a FROM t FOR KEY SHARE"],
+#   ["SELECT a FROM t FOR UPDATE NOWAIT"],
+#   ["SELECT a FROM t FOR UPDATE SKIP LOCKED"],
+#   ["SELECT a FROM t FOR UPDATE OF t"],
+#   ["SELECT a FROM t, u FOR UPDATE OF t, u SKIP LOCKED"],
+#   ["SELECT a FROM t FOR SHARE OF t FOR UPDATE OF u"],
+#   ["SELECT a FROM t ORDER BY a LIMIT 1 FOR UPDATE"],
+#   ["WITH c AS (SELECT 1) SELECT * FROM c"],
+#   ["WITH c (x) AS (SELECT 1) SELECT x FROM c"],
+#   ["WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b"],
+#   ["WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r"],
+#   ["WITH c AS MATERIALIZED (SELECT 1) SELECT * FROM c"],
+#   ["SELECT 1 UNION SELECT 2"],
+#   ["SELECT 1 UNION ALL SELECT 2"],
+#   ["SELECT 1 INTERSECT SELECT 2"],
+#   ["SELECT 1 EXCEPT SELECT 2"],
+#   ["SELECT 1 UNION SELECT 2 UNION SELECT 3"],
+#   ["SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 1"],
+#   ["(SELECT 1 ORDER BY 1 LIMIT 1) UNION (SELECT 2)"],
+#   ["VALUES (1, 'a'), (2, 'b')"],
+#   ["SELECT * FROM (VALUES (1), (2)) AS v (n)"],
+#   ["INSERT INTO t VALUES (1)"],
+#   ["INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')"],
+#   ["INSERT INTO t (a) SELECT b FROM u"],
+#   ["INSERT INTO t DEFAULT VALUES"],
+#   ["INSERT INTO s.t (a) VALUES (DEFAULT)"],
+#   ["INSERT OR REPLACE INTO t (a) VALUES (1)"],
+#   ["INSERT IGNORE INTO t (a) VALUES (1)"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = excluded.a"],
+#   ["INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 3 WHERE t.a > 0"],
+#   ["INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = a + 1, b = 2"],
+#   ["INSERT INTO t (a) VALUES (1) RETURNING a, b AS c"],
+#   ["INSERT INTO t (a) VALUES (1) RETURNING *"],
+#   ["UPDATE t SET a = 1"],
+#   ["UPDATE t SET a = 1, b = b + 1 WHERE id = 2"],
+#   ["UPDATE t AS x SET a = 1 FROM u WHERE x.id = u.id"],
+#   ["UPDATE ONLY t SET a = 1 RETURNING a"],
+#   ["UPDATE s.t SET s.t.a = 1"],
+#   ["DELETE FROM t"],
+#   ["DELETE FROM t WHERE id = 1"],
+#   ["DELETE FROM t AS x USING u WHERE x.id = u.id"],
+#   ["DELETE FROM ONLY t WHERE a IN (1, 2) RETURNING *"],
+#   ["CREATE TABLE a (\n  id INT\n)"],
+#   ["CREATE TEMPORARY TABLE IF NOT EXISTS a (\n  id INT\n)"],
+#   ["CREATE TABLE a (\n  id INT PRIMARY KEY,\n  n TEXT NOT NULL\n)"],
+#   ["CREATE TABLE a (\n  id INT NOT NULL DEFAULT 0,\n  n TEXT DEFAULT 'x',\n  t TIMESTAMP DEFAULT now()\n)"],
+#   ["CREATE TABLE a (\n  id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT 'the id'\n)"],
+#   ["CREATE TABLE a (\n  u INT REFERENCES users (id) ON DELETE CASCADE ON UPDATE SET NULL\n)"],
+#   ["CREATE TABLE a (\n  u INT REFERENCES users\n)"],
+#   ["CREATE TABLE a (\n  x INT CHECK (x > 0),\n  y INT UNIQUE\n)"],
+#   ["CREATE TABLE a (\n  x INT,\n  y INT,\n  PRIMARY KEY (x, y)\n)"],
+#   ["CREATE TABLE a (\n  x INT,\n  CONSTRAINT pk PRIMARY KEY (x)\n)"],
+#   ["CREATE TABLE a (\n  x INT,\n  UNIQUE (x),\n  CONSTRAINT u2 UNIQUE (x)\n)"],
+#   ["CREATE TABLE a (\n  x INT,\n  FOREIGN KEY (x) REFERENCES b (id)\n)"],
+#   ["CREATE TABLE a (\n  x INT,\n  CONSTRAINT fk FOREIGN KEY (x) REFERENCES b (id) ON DELETE NO ACTION\n)"],
+#   ["CREATE TABLE a (\n  x INT,\n  CHECK (x > 0),\n  CONSTRAINT c2 CHECK (x < 10)\n)"],
+#   ["CREATE TABLE a (\n  x INT,\n  KEY idx (x)\n)"],
+#   ["CREATE TABLE a (\n  price DECIMAL(10, 2),\n  n VARCHAR(255),\n  t TIMESTAMP WITH TIME ZONE\n)"],
+#   ["CREATE TABLE a (\n  id INT\n) COMMENT = 'tbl'"],
+#   ["CREATE TABLE a AS SELECT * FROM b"],
+#   ["CREATE INDEX i ON t (a)"],
+#   ["CREATE UNIQUE INDEX i ON t (a, b DESC)"],
+#   ["CREATE INDEX IF NOT EXISTS i ON t USING BTREE (lower(a))"],
+#   ["CREATE INDEX ON t (a) WHERE a > 0"],
+#   ["CREATE VIEW v AS SELECT 1"],
+#   ["CREATE OR REPLACE VIEW v (a, b) AS SELECT 1, 2"],
+#   ["CREATE MATERIALIZED VIEW v AS SELECT 1"],
+#   ["CREATE TEMPORARY VIEW IF NOT EXISTS v AS SELECT 1"],
+#   ["ALTER TABLE t ADD COLUMN c INT"],
+#   ["ALTER TABLE t ADD COLUMN c INT NOT NULL DEFAULT 0"],
+#   ["ALTER TABLE t DROP COLUMN c"],
+#   ["ALTER TABLE t DROP CONSTRAINT c"],
+#   ["ALTER TABLE t RENAME TO u"],
+#   ["ALTER TABLE t RENAME COLUMN a TO b"],
+#   ["ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (id)"],
+#   ["ALTER TABLE ONLY t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u (id) ON DELETE CASCADE"],
+#   ["ALTER TABLE t ADD UNIQUE (a)"],
+#   ["ALTER TABLE t ADD COLUMN a INT, DROP COLUMN b"],
+#   ["ALTER TABLE t ALTER COLUMN a SET NOT NULL"],
+#   ["DROP TABLE t"],
+#   ["DROP TABLE IF EXISTS a, b CASCADE"],
+#   ["DROP VIEW v"],
+#   ["DROP INDEX i ON t"],
+#   ["DROP SCHEMA s CASCADE"],
+#   ["TRUNCATE TABLE t"],
+#   ["TRUNCATE TABLE a, b"],
+#   ["COMMENT ON TABLE t IS 'x'"],
+#   ["COMMENT ON COLUMN t.c IS 'it''s'"],
+#   ["COMMENT ON COLUMN t.c IS NULL"],
+#   ["GRANT SELECT ON t TO bob"],
+#   ["SET search_path = public"],
+#   ["BEGIN"],
+#   ["SELECT 1"],
+#   ["SELECT 1"],
+#   ["SELECT 'a''b'"],
+#   ["SELECT a FROM t"],
+#   ["SELECT a FROM t WHERE b = 1 ORDER BY a DESC LIMIT 1"],
+#   ["SELECT \"my col\", \"select\" FROM \"my tbl\""],
+#   ["SELECT * FROM \"s\".\"t\""]
+# ])
+def test_stringify_is_idempotent(sql):
+  assert_eq(sql_stringify(first(sql_ast(sql))), sql)
+end
+
+# Statement node types
+# @parametrize([
+#   ["SELECT 1", "select"],
+#   ["SELECT 1 UNION SELECT 2", "set_op"],
+#   ["VALUES (1)", "values"],
+#   ["(SELECT 1)", "select"],
+#   ["INSERT INTO t VALUES (1)", "insert"],
+#   ["UPDATE t SET a = 1", "update"],
+#   ["DELETE FROM t", "delete"],
+#   ["CREATE TABLE a (x INT)", "create_table"],
+#   ["CREATE TABLE a AS SELECT 1", "create_table"],
+#   ["CREATE INDEX i ON t (a)", "create_index"],
+#   ["CREATE VIEW v AS SELECT 1", "create_view"],
+#   ["ALTER TABLE t DROP COLUMN c", "alter_table"],
+#   ["DROP TABLE t", "drop"],
+#   ["TRUNCATE t", "truncate"],
+#   ["COMMENT ON TABLE t IS 'x'", "comment_on"],
+#   ["GRANT ALL ON t TO u", "unknown"],
+#   ["BEGIN", "unknown"],
+#   ["CREATE FUNCTION f() RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql", "unknown"],
+#   ["CREATE TABLE a LIKE b", "unknown"],
+#   ["ALTER INDEX i RENAME TO j", "unknown"],
+#   ["DROP FUNCTION f", "unknown"],
+#   ["COMMENT 'x'", "unknown"],
+#   ["WITH c AS (SELECT 1) SELECT * FROM c", "select"],
+#   ["WITH c AS (SELECT 1) SELECT 1 UNION SELECT 2", "set_op"]
+# ])
+def test_statement_type(sql, expected):
+  assert_eq(first(sql_ast(sql))["type"], expected)
+end
+
+def _expr_of(sql):
+  first(first(sql_ast("SELECT " + sql))["columns"])["expr"]
+end
+
+# Expression structure: [expression, path into the node, expected value]
+# @parametrize([
+#   ["a OR b AND c", ["op"], "OR"],
+#   ["a OR b AND c", ["right", "op"], "AND"],
+#   ["a AND b OR c", ["op"], "OR"],
+#   ["1 + 2 * 3", ["op"], "+"],
+#   ["1 + 2 * 3", ["right", "op"], "*"],
+#   ["1 * 2 + 3", ["left", "op"], "*"],
+#   ["(1 + 2) * 3", ["op"], "*"],
+#   ["(1 + 2) * 3", ["left", "paren"], true],
+#   ["1 - 2 - 3", ["left", "op"], "-"],
+#   ["1 - 2 - 3", ["right", "value"], "3"],
+#   ["2 ^ 3 ^ 4", ["left", "op"], "^"],
+#   ["NOT a = b", ["op"], "NOT"],
+#   ["NOT a = b", ["expr", "op"], "="],
+#   ["NOT a AND b", ["op"], "AND"],
+#   ["NOT a AND b", ["left", "op"], "NOT"],
+#   ["-a * b", ["op"], "*"],
+#   ["-a * b", ["left", "type"], "unary"],
+#   ["-a::int", ["op"], "-"],
+#   ["-a::int", ["expr", "type"], "cast"],
+#   ["a || b + c", ["op"], "||"],
+#   ["a || b + c", ["right", "op"], "+"],
+#   ["x::int + 1", ["op"], "+"],
+#   ["x::int + 1", ["left", "type"], "cast"],
+#   ["a = 1 AND b = 2", ["op"], "AND"],
+#   ["a < b", ["op"], "<"],
+#   ["a <= b", ["op"], "<="],
+#   ["a <> b", ["op"], "<>"],
+#   ["a != b", ["op"], "!="],
+#   ["a BETWEEN 1 AND 2", ["type"], "between"],
+#   ["a BETWEEN 1 AND 2", ["low", "value"], "1"],
+#   ["a BETWEEN 1 AND 2", ["high", "value"], "2"],
+#   ["a NOT BETWEEN 1 AND 2", ["negated"], true],
+#   ["a BETWEEN 1 AND 2 AND c", ["op"], "AND"],
+#   ["a IN (1, 2)", ["values", 1, "value"], "2"],
+#   ["a NOT IN (1)", ["negated"], true],
+#   ["a IN (SELECT 1)", ["query", "type"], "select"],
+#   ["a IS NOT NULL", ["what"], "NULL"],
+#   ["a IS NOT NULL", ["negated"], true],
+#   ["a IS TRUE", ["what"], "TRUE"],
+#   ["a IS NULL", ["negated"], false],
+#   ["a IS DISTINCT FROM b", ["op"], "IS DISTINCT FROM"],
+#   ["a IS NOT DISTINCT FROM b", ["op"], "IS NOT DISTINCT FROM"],
+#   ["a LIKE 'x' ESCAPE '!'", ["escape", "value"], "!"],
+#   ["a NOT LIKE 'x'", ["op"], "NOT LIKE"],
+#   ["a ILIKE 'x'", ["op"], "ILIKE"],
+#   ["a SIMILAR TO 'x'", ["op"], "SIMILAR TO"],
+#   ["'it''s'", ["value"], "it's"],
+#   ["'a'", ["kind"], "string"],
+#   ["1.5e3", ["value"], "1.5e3"],
+#   ["1.5e3", ["kind"], "number"],
+#   ["0xFF", ["value"], "0xFF"],
+#   [".5", ["value"], ".5"],
+#   ["NULL", ["kind"], "null"],
+#   ["TRUE", ["value"], true],
+#   ["FALSE", ["value"], false],
+#   ["DEFAULT", ["kind"], "default"],
+#   ["s.t.c", ["parts"], ["s", "t", "c"]],
+#   ["\"a b\"", ["parts"], ["a b"]],
+#   ["t.*", ["table"], "t"],
+#   ["t.*", ["type"], "star"],
+#   ["*", ["table"], None],
+#   ["count(DISTINCT a)", ["distinct"], true],
+#   ["count(*)", ["args", 0, "type"], "star"],
+#   ["s.f(1)", ["name"], "s.f"],
+#   ["now()", ["args"], []],
+#   ["coalesce(a, b, 0)", ["args", 2, "value"], "0"],
+#   ["extract(year FROM d)", ["seps"], ["FROM"]],
+#   ["substring(a FROM 1 FOR 2)", ["seps"], ["FROM", "FOR"]],
+#   ["position('a' IN b)", ["seps"], ["IN"]],
+#   ["trim(BOTH 'x' FROM y)", ["modifier"], "BOTH"],
+#   ["f(a, b)", ["seps"], [","]],
+#   ["sum(a) FILTER (WHERE b > 1)", ["filter", "op"], ">"],
+#   ["sum(a) OVER (PARTITION BY b ORDER BY c DESC)", ["over", "order_by", 0, "direction"], "DESC"],
+#   ["sum(a) OVER (PARTITION BY b ORDER BY c DESC)", ["over", "partition_by", 0, "parts"], ["b"]],
+#   ["rank() OVER w", ["over", "name"], "w"],
+#   ["rank() OVER ()", ["over", "partition_by"], []],
+#   ["sum(a) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)", ["over", "frame"], "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW"],
+#   ["rank() OVER (ORDER BY a NULLS LAST)", ["over", "order_by", 0, "nulls"], "LAST"],
+#   ["CASE WHEN a THEN 1 END", ["whens", 0, "result", "value"], "1"],
+#   ["CASE a WHEN 1 THEN 2 END", ["operand", "parts"], ["a"]],
+#   ["CASE WHEN a THEN 1 ELSE 2 END", ["else", "value"], "2"],
+#   ["CASE WHEN a THEN 1 END", ["else"], None],
+#   ["CAST(x AS DECIMAL(10, 2))", ["data_type"], "DECIMAL(10, 2)"],
+#   ["CAST(x AS int)", ["style"], "cast"],
+#   ["x::int", ["style"], "::"],
+#   ["x::timestamp with time zone", ["data_type"], "timestamp with time zone"],
+#   ["x::int[]", ["data_type"], "int[]"],
+#   ["x::double precision", ["data_type"], "double precision"],
+#   ["x::a.b", ["data_type"], "a.b"],
+#   ["x::varchar(10)", ["data_type"], "varchar(10)"],
+#   ["'1'::int::text", ["expr", "data_type"], "int"],
+#   ["EXISTS (SELECT 1)", ["type"], "exists"],
+#   ["(SELECT 1)", ["type"], "subquery"],
+#   ["(1, 2)", ["items", 1, "value"], "2"],
+#   ["(1)", ["paren"], true],
+#   ["INTERVAL '1' DAY", ["unit"], "DAY"],
+#   ["INTERVAL '1 day'", ["unit"], None],
+#   ["DATE '2020-01-01'", ["data_type"], "DATE"],
+#   ["TIMESTAMP '2020-01-01'", ["value"], "2020-01-01"],
+#   ["$1", ["value"], "$1"],
+#   ["?", ["type"], "param"],
+#   [":name", ["value"], ":name"],
+#   ["@var", ["parts"], ["@var"]],
+#   ["a -> 'k'", ["op"], "->"],
+#   ["a ->> 'k'", ["op"], "->>"],
+#   ["a @> b", ["op"], "@>"],
+#   ["a && b", ["op"], "&&"],
+#   ["a ~ 'x'", ["op"], "~"],
+#   ["a % b", ["op"], "%"],
+#   ["a / b", ["op"], "/"]
+# ])
+def test_expression_shape(sql, path, expected):
+  assert_eq(_path(_expr_of(sql), path), expected)
+end
+
+# Statement structure: [statement, path into the first node, expected value]
+# @parametrize([
+#   ["SELECT a FROM t", ["from", 0, "name"], "t"],
+#   ["SELECT a FROM t AS x", ["from", 0, "alias"], "x"],
+#   ["SELECT a FROM t x", ["from", 0, "alias"], "x"],
+#   ["SELECT a FROM s.t", ["from", 0, "name"], "s.t"],
+#   ["SELECT a AS x", ["columns", 0, "alias"], "x"],
+#   ["SELECT a x", ["columns", 0, "alias"], "x"],
+#   ["SELECT a", ["columns", 0, "alias"], None],
+#   ["SELECT DISTINCT a", ["distinct"], true],
+#   ["SELECT a", ["distinct"], false],
+#   ["SELECT DISTINCT ON (a) b", ["distinct_on", 0, "parts"], ["a"]],
+#   ["SELECT a FROM t WHERE a = 1", ["where", "op"], "="],
+#   ["SELECT a FROM t GROUP BY a, b", ["group_by", 1, "parts"], ["b"]],
+#   ["SELECT a FROM t HAVING count(*) > 1", ["having", "op"], ">"],
+#   ["SELECT a FROM t ORDER BY a DESC", ["order_by", 0, "direction"], "DESC"],
+#   ["SELECT a FROM t ORDER BY a", ["order_by", 0, "direction"], None],
+#   ["SELECT a FROM t LIMIT 5", ["limit", "value"], "5"],
+#   ["SELECT a FROM t OFFSET 3", ["offset", "value"], "3"],
+#   ["SELECT a FROM t LIMIT 5, 10", ["offset", "value"], "5"],
+#   ["SELECT a FROM t LIMIT 5, 10", ["limit", "value"], "10"],
+#   ["SELECT a FROM t LIMIT ALL", ["limit", "kind"], "all"],
+#   ["SELECT a FROM t FETCH FIRST 10 ROWS ONLY", ["fetch", "count", "value"], "10"],
+#   ["SELECT a FROM t FETCH FIRST ROW ONLY", ["fetch", "count"], None],
+#   ["SELECT a FROM t FETCH FIRST 1 ROWS WITH TIES", ["fetch", "with_ties"], true],
+#   ["SELECT a FROM t FOR UPDATE", ["locking", 0, "strength"], "UPDATE"],
+#   ["SELECT a FROM t FOR SHARE", ["locking", 0, "strength"], "SHARE"],
+#   ["SELECT a FROM t FOR NO KEY UPDATE", ["locking", 0, "strength"], "NO KEY UPDATE"],
+#   ["SELECT a FROM t FOR KEY SHARE", ["locking", 0, "strength"], "KEY SHARE"],
+#   ["SELECT a FROM t FOR UPDATE OF t, u", ["locking", 0, "of"], ["t", "u"]],
+#   ["SELECT a FROM t FOR UPDATE NOWAIT", ["locking", 0, "wait"], "NOWAIT"],
+#   ["SELECT a FROM t FOR UPDATE SKIP LOCKED", ["locking", 0, "wait"], "SKIP LOCKED"],
+#   ["SELECT a FROM t FOR UPDATE", ["locking", 0, "wait"], None],
+#   ["SELECT a FROM t FOR SHARE FOR UPDATE", ["locking", 1, "strength"], "UPDATE"],
+#   ["SELECT a FROM t", ["locking"], []],
+#   ["SELECT a FROM t WINDOW w AS (ORDER BY a)", ["windows", 0, "name"], "w"],
+#   ["SELECT a FROM t WINDOW w AS (ORDER BY a), v AS (w)", ["windows", 1, "spec", "name"], "w"],
+#   ["SELECT a FROM t WINDOW w AS (PARTITION BY a)", ["windows", 0, "spec", "partition_by", 0, "parts"], ["a"]],
+#   ["SELECT a FROM t JOIN u ON t.x = u.x", ["from", 0, "kind"], "INNER"],
+#   ["SELECT a FROM t LEFT JOIN u ON t.x = u.x", ["from", 0, "kind"], "LEFT"],
+#   ["SELECT a FROM t RIGHT OUTER JOIN u ON t.x = u.x", ["from", 0, "kind"], "RIGHT"],
+#   ["SELECT a FROM t FULL JOIN u ON t.x = u.x", ["from", 0, "kind"], "FULL"],
+#   ["SELECT a FROM t CROSS JOIN u", ["from", 0, "kind"], "CROSS"],
+#   ["SELECT a FROM t NATURAL JOIN u", ["from", 0, "natural"], true],
+#   ["SELECT a FROM t JOIN u USING (x, y)", ["from", 0, "using"], ["x", "y"]],
+#   ["SELECT a FROM t JOIN u ON t.x = u.x", ["from", 0, "on", "op"], "="],
+#   ["SELECT a FROM t JOIN u ON 1 = 1 JOIN v ON 2 = 2", ["from", 0, "left", "type"], "join"],
+#   ["SELECT a FROM t, u", ["from", 1, "name"], "u"],
+#   ["SELECT a FROM (SELECT 1) s", ["from", 0, "alias"], "s"],
+#   ["SELECT a FROM (SELECT 1) s", ["from", 0, "query", "type"], "select"],
+#   ["SELECT a FROM (SELECT 1) s (x, y)", ["from", 0, "columns"], ["x", "y"]],
+#   ["SELECT a FROM f(1) g", ["from", 0, "type"], "table_function"],
+#   ["SELECT a FROM t, LATERAL (SELECT 1) l", ["from", 1, "lateral"], true],
+#   ["SELECT a FROM t", ["from", 0, "type"], "table"],
+#   ["WITH c AS (SELECT 1) SELECT 1", ["with", 0, "name"], "c"],
+#   ["WITH c (x, y) AS (SELECT 1, 2) SELECT 1", ["with", 0, "columns"], ["x", "y"]],
+#   ["WITH RECURSIVE c AS (SELECT 1) SELECT 1", ["recursive"], true],
+#   ["WITH a AS (SELECT 1), b AS (SELECT 2) SELECT 1", ["with", 1, "name"], "b"],
+#   ["SELECT 1", ["with"], []],
+#   ["SELECT 1 UNION ALL SELECT 2", ["all"], true],
+#   ["SELECT 1 UNION SELECT 2", ["all"], false],
+#   ["SELECT 1 INTERSECT SELECT 2", ["op"], "INTERSECT"],
+#   ["SELECT 1 EXCEPT SELECT 2", ["op"], "EXCEPT"],
+#   ["SELECT 1 UNION SELECT 2 UNION SELECT 3", ["left", "op"], "UNION"],
+#   ["(SELECT 1 LIMIT 1) UNION (SELECT 2)", ["left", "paren"], true],
+#   ["(SELECT 1 LIMIT 1) UNION (SELECT 2)", ["left", "limit", "value"], "1"],
+#   ["SELECT 1 UNION SELECT 2 LIMIT 3", ["limit", "value"], "3"],
+#   ["VALUES (1, 2), (3, 4)", ["rows", 1, 0, "value"], "3"],
+#   ["INSERT INTO t VALUES (1)", ["table"], "t"],
+#   ["INSERT INTO t (a, b) VALUES (1, 2)", ["columns"], ["a", "b"]],
+#   ["INSERT INTO t (a) VALUES (1), (2)", ["source", "rows", 1, 0, "value"], "2"],
+#   ["INSERT INTO t (a) SELECT 1", ["source", "type"], "select"],
+#   ["INSERT INTO t DEFAULT VALUES", ["source"], None],
+#   ["INSERT INTO t (a) (SELECT 1)", ["source", "paren"], true],
+#   ["INSERT OR REPLACE INTO t VALUES (1)", ["modifier"], "OR REPLACE"],
+#   ["INSERT IGNORE INTO t VALUES (1)", ["modifier"], "IGNORE"],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING", ["on_conflict", "action"], "NOTHING"],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT (a, b) DO NOTHING", ["on_conflict", "target"], ["a", "b"]],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 1", ["on_conflict", "set", 0, "column"], "b"],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 1 WHERE c", ["on_conflict", "where", "parts"], ["c"]],
+#   ["INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = 1", ["on_duplicate_key_update", 0, "column"], "a"],
+#   ["INSERT INTO t VALUES (1) RETURNING a, b", ["returning", 1, "expr", "parts"], ["b"]],
+#   ["INSERT INTO t VALUES (1)", ["on_conflict"], None],
+#   ["UPDATE t SET a = 1, b = 2", ["set", 1, "column"], "b"],
+#   ["UPDATE t SET a = 1", ["set", 0, "value", "value"], "1"],
+#   ["UPDATE t x SET a = 1", ["alias"], "x"],
+#   ["UPDATE t SET a = 1 WHERE b", ["where", "parts"], ["b"]],
+#   ["UPDATE t SET a = 1 FROM u", ["from", 0, "name"], "u"],
+#   ["UPDATE t SET a = 1 RETURNING a", ["returning", 0, "expr", "parts"], ["a"]],
+#   ["UPDATE s.t SET a = 1", ["table"], "s.t"],
+#   ["DELETE FROM t", ["table"], "t"],
+#   ["DELETE FROM t x", ["alias"], "x"],
+#   ["DELETE FROM t WHERE a", ["where", "parts"], ["a"]],
+#   ["DELETE FROM t USING u", ["using", 0, "name"], "u"],
+#   ["DELETE FROM t RETURNING *", ["returning", 0, "expr", "type"], "star"]
+# ])
+def test_statement_shape(sql, path, expected):
+  assert_eq(_path(first(sql_ast(sql)), path), expected)
+end
+
+# DDL and other statements: [statement, path into the first node, expected value]
+# @parametrize([
+#   ["CREATE TABLE a (x INT)", ["name"], "a"],
+#   ["CREATE TABLE s.a (x INT)", ["name"], "s.a"],
+#   ["CREATE TABLE IF NOT EXISTS a (x INT)", ["if_not_exists"], true],
+#   ["CREATE TEMP TABLE a (x INT)", ["temporary"], true],
+#   ["CREATE TABLE a (x INT)", ["temporary"], false],
+#   ["CREATE TABLE a AS SELECT 1", ["as", "type"], "select"],
+#   ["CREATE TABLE a (x INT) COMMENT 'c'", ["comment"], "c"],
+#   ["CREATE TABLE a (x INT) ENGINE=InnoDB COMMENT='c'", ["comment"], "c"],
+#   ["CREATE TABLE a (x INT)", ["comment"], None],
+#   ["CREATE TABLE a (x INT, y TEXT)", ["columns", 1, "name"], "y"],
+#   ["CREATE TABLE a (x INT)", ["columns", 0, "data_type"], "INT"],
+#   ["CREATE TABLE a (x DECIMAL(10, 2))", ["columns", 0, "data_type"], "DECIMAL(10, 2)"],
+#   ["CREATE TABLE a (x CHARACTER VARYING(5))", ["columns", 0, "data_type"], "CHARACTER VARYING(5)"],
+#   ["CREATE TABLE a (x DOUBLE PRECISION)", ["columns", 0, "data_type"], "DOUBLE PRECISION"],
+#   ["CREATE TABLE a (x TIMESTAMP WITHOUT TIME ZONE)", ["columns", 0, "data_type"], "TIMESTAMP WITHOUT TIME ZONE"],
+#   ["CREATE TABLE a (x INT UNSIGNED)", ["columns", 0, "data_type"], "INT UNSIGNED"],
+#   ["CREATE TABLE a (x INT[])", ["columns", 0, "data_type"], "INT[]"],
+#   ["CREATE TABLE a (x ENUM('a', 'b'))", ["columns", 0, "data_type"], "ENUM('a', 'b')"],
+#   ["CREATE TABLE a (x)", ["columns", 0, "data_type"], ""],
+#   ["CREATE TABLE a (x VARCHAR(10) CHARACTER SET utf8 NOT NULL)", ["columns", 0, "data_type"], "VARCHAR(10)"],
+#   ["CREATE TABLE a (x INT NOT NULL)", ["columns", 0, "nullable"], false],
+#   ["CREATE TABLE a (x INT NULL)", ["columns", 0, "nullable"], true],
+#   ["CREATE TABLE a (x INT)", ["columns", 0, "nullable"], true],
+#   ["CREATE TABLE a (x INT DEFAULT 1)", ["columns", 0, "default", "value"], "1"],
+#   ["CREATE TABLE a (x INT DEFAULT -1)", ["columns", 0, "default", "op"], "-"],
+#   ["CREATE TABLE a (x TEXT DEFAULT 'a, b')", ["columns", 0, "default", "value"], "a, b"],
+#   ["CREATE TABLE a (x TEXT DEFAULT NULL)", ["columns", 0, "default", "kind"], "null"],
+#   ["CREATE TABLE a (x TS DEFAULT now())", ["columns", 0, "default", "name"], "now"],
+#   ["CREATE TABLE a (x TS DEFAULT CURRENT_TIMESTAMP)", ["columns", 0, "default", "parts"], ["CURRENT_TIMESTAMP"]],
+#   ["CREATE TABLE a (x TEXT DEFAULT 'q'::text)", ["columns", 0, "default", "style"], "::"],
+#   ["CREATE TABLE a (x INT DEFAULT (1 + 2))", ["columns", 0, "default", "paren"], true],
+#   ["CREATE TABLE a (x INT DEFAULT 0 NOT NULL)", ["columns", 0, "nullable"], false],
+#   ["CREATE TABLE a (x BOOL DEFAULT TRUE)", ["columns", 0, "default", "value"], true],
+#   ["CREATE TABLE a (x INT)", ["columns", 0, "default"], None],
+#   ["CREATE TABLE a (x INT PRIMARY KEY)", ["columns", 0, "primary_key"], true],
+#   ["CREATE TABLE a (x INT)", ["columns", 0, "primary_key"], false],
+#   ["CREATE TABLE a (x INT UNIQUE)", ["columns", 0, "unique"], true],
+#   ["CREATE TABLE a (x INT AUTO_INCREMENT)", ["columns", 0, "auto_increment"], true],
+#   ["CREATE TABLE a (x INTEGER AUTOINCREMENT)", ["columns", 0, "auto_increment"], true],
+#   ["CREATE TABLE a (x INT GENERATED ALWAYS AS IDENTITY)", ["columns", 0, "auto_increment"], true],
+#   ["CREATE TABLE a (x INT COMMENT 'c')", ["columns", 0, "comment"], "c"],
+#   ["CREATE TABLE a (x INT CHECK (x > 0))", ["columns", 0, "check", "op"], ">"],
+#   ["CREATE TABLE a (x INT COLLATE nocase NOT NULL)", ["columns", 0, "nullable"], false],
+#   ["CREATE TABLE a (x INT CONSTRAINT c NOT NULL)", ["columns", 0, "nullable"], false],
+#   ["CREATE TABLE a (x INT REFERENCES b (id))", ["columns", 0, "references", "table"], "b"],
+#   ["CREATE TABLE a (x INT REFERENCES b (id))", ["columns", 0, "references", "columns"], ["id"]],
+#   ["CREATE TABLE a (x INT REFERENCES b)", ["columns", 0, "references", "columns"], []],
+#   ["CREATE TABLE a (x INT REFERENCES s.b (id))", ["columns", 0, "references", "table"], "s.b"],
+#   ["CREATE TABLE a (x INT REFERENCES b (id) ON DELETE CASCADE)", ["columns", 0, "references", "on_delete"], "CASCADE"],
+#   ["CREATE TABLE a (x INT REFERENCES b (id) ON UPDATE RESTRICT)", ["columns", 0, "references", "on_update"], "RESTRICT"],
+#   ["CREATE TABLE a (x INT REFERENCES b (id) ON DELETE SET NULL)", ["columns", 0, "references", "on_delete"], "SET NULL"],
+#   ["CREATE TABLE a (x INT REFERENCES b (id) ON DELETE SET DEFAULT)", ["columns", 0, "references", "on_delete"], "SET DEFAULT"],
+#   ["CREATE TABLE a (x INT REFERENCES b (id) ON DELETE NO ACTION)", ["columns", 0, "references", "on_delete"], "NO ACTION"],
+#   ["CREATE TABLE a (x INT REFERENCES b (id) ON DELETE CASCADE ON UPDATE CASCADE)", ["columns", 0, "references", "on_update"], "CASCADE"],
+#   ["CREATE TABLE a (x INT)", ["columns", 0, "references"], None],
+#   ["CREATE TABLE a (`x y` INT, \"z\" INT, [w] INT)", ["columns", 0, "name"], "x y"],
+#   ["CREATE TABLE a (`x y` INT, \"z\" INT, [w] INT)", ["columns", 2, "name"], "w"],
+#   ["CREATE TABLE a (x INT, PRIMARY KEY (x))", ["constraints", 0, "kind"], "primary_key"],
+#   ["CREATE TABLE a (x INT, y INT, PRIMARY KEY (x, y))", ["constraints", 0, "columns"], ["x", "y"]],
+#   ["CREATE TABLE a (x INT, CONSTRAINT pk PRIMARY KEY (x))", ["constraints", 0, "name"], "pk"],
+#   ["CREATE TABLE a (x INT, PRIMARY KEY (x))", ["constraints", 0, "name"], None],
+#   ["CREATE TABLE a (x INT, UNIQUE (x))", ["constraints", 0, "kind"], "unique"],
+#   ["CREATE TABLE a (x INT, UNIQUE KEY u (x))", ["constraints", 0, "columns"], ["x"]],
+#   ["CREATE TABLE a (x INT, CHECK (x > 0))", ["constraints", 0, "expr", "op"], ">"],
+#   ["CREATE TABLE a (x INT, CONSTRAINT c CHECK (x > 0))", ["constraints", 0, "name"], "c"],
+#   ["CREATE TABLE a (x INT, FOREIGN KEY (x) REFERENCES b (id))", ["constraints", 0, "kind"], "foreign_key"],
+#   ["CREATE TABLE a (x INT, FOREIGN KEY (x) REFERENCES b (id))", ["constraints", 0, "ref_table"], "b"],
+#   ["CREATE TABLE a (x INT, FOREIGN KEY (x) REFERENCES b (id))", ["constraints", 0, "ref_columns"], ["id"]],
+#   ["CREATE TABLE a (x INT, FOREIGN KEY (x) REFERENCES b (id) ON DELETE CASCADE)", ["constraints", 0, "on_delete"], "CASCADE"],
+#   ["CREATE TABLE a (x INT, y INT, FOREIGN KEY (x, y) REFERENCES b (p, q))", ["constraints", 0, "columns"], ["x", "y"]],
+#   ["CREATE TABLE a (x INT, KEY idx (x))", ["constraints", 0, "kind"], "index"],
+#   ["CREATE TABLE a (x INT, INDEX idx (x))", ["constraints", 0, "name"], "idx"],
+#   ["CREATE TABLE a (x INT, FULLTEXT KEY ft (x))", ["constraints", 0, "kind"], "index"],
+#   ["CREATE TABLE a (`key` VARCHAR(10), id INT)", ["columns", 0, "name"], "key"],
+#   ["CREATE TABLE a (x INT, y INT)", ["constraints"], []],
+#   ["CREATE INDEX i ON t (a)", ["name"], "i"],
+#   ["CREATE INDEX ON t (a)", ["name"], None],
+#   ["CREATE INDEX i ON t (a)", ["table"], "t"],
+#   ["CREATE INDEX i ON s.t (a)", ["table"], "s.t"],
+#   ["CREATE UNIQUE INDEX i ON t (a)", ["unique"], true],
+#   ["CREATE INDEX i ON t (a)", ["unique"], false],
+#   ["CREATE INDEX IF NOT EXISTS i ON t (a)", ["if_not_exists"], true],
+#   ["CREATE INDEX CONCURRENTLY i ON t (a)", ["name"], "i"],
+#   ["CREATE INDEX i ON t USING gin (a)", ["method"], "GIN"],
+#   ["CREATE INDEX i ON t (a)", ["method"], None],
+#   ["CREATE INDEX i ON t (a, b DESC)", ["columns", 1, "direction"], "DESC"],
+#   ["CREATE INDEX i ON t (lower(a))", ["columns", 0, "expr", "name"], "lower"],
+#   ["CREATE INDEX i ON t (a) WHERE a > 0", ["where", "op"], ">"],
+#   ["CREATE INDEX i ON ONLY t (a)", ["table"], "t"],
+#   ["CREATE VIEW v AS SELECT 1", ["name"], "v"],
+#   ["CREATE VIEW v AS SELECT 1", ["query", "type"], "select"],
+#   ["CREATE VIEW v (a, b) AS SELECT 1, 2", ["columns"], ["a", "b"]],
+#   ["CREATE OR REPLACE VIEW v AS SELECT 1", ["or_replace"], true],
+#   ["CREATE TEMP VIEW v AS SELECT 1", ["temporary"], true],
+#   ["CREATE MATERIALIZED VIEW v AS SELECT 1", ["materialized"], true],
+#   ["CREATE VIEW IF NOT EXISTS v AS SELECT 1", ["if_not_exists"], true],
+#   ["CREATE VIEW v AS SELECT 1 UNION SELECT 2", ["query", "type"], "set_op"],
+#   ["ALTER TABLE t ADD COLUMN c INT", ["actions", 0, "action"], "add_column"],
+#   ["ALTER TABLE t ADD c INT", ["actions", 0, "column", "name"], "c"],
+#   ["ALTER TABLE t ADD COLUMN IF NOT EXISTS c INT", ["actions", 0, "column", "name"], "c"],
+#   ["ALTER TABLE t ADD COLUMN c INT NOT NULL", ["actions", 0, "column", "nullable"], false],
+#   ["ALTER TABLE t DROP COLUMN c", ["actions", 0, "name"], "c"],
+#   ["ALTER TABLE t DROP CONSTRAINT c", ["actions", 0, "action"], "drop_constraint"],
+#   ["ALTER TABLE t RENAME TO u", ["actions", 0, "to"], "u"],
+#   ["ALTER TABLE t RENAME COLUMN a TO b", ["actions", 0, "from"], "a"],
+#   ["ALTER TABLE t RENAME COLUMN a TO b", ["actions", 0, "to"], "b"],
+#   ["ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (id)", ["actions", 0, "constraint", "kind"], "primary_key"],
+#   ["ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u (id)", ["actions", 0, "constraint", "ref_table"], "u"],
+#   ["ALTER TABLE t ADD PRIMARY KEY (id)", ["actions", 0, "constraint", "columns"], ["id"]],
+#   ["ALTER TABLE t ADD UNIQUE (a)", ["actions", 0, "constraint", "kind"], "unique"],
+#   ["ALTER TABLE t ADD CHECK (a > 0)", ["actions", 0, "constraint", "kind"], "check"],
+#   ["ALTER TABLE t ADD COLUMN a INT, DROP COLUMN b", ["actions", 1, "action"], "drop_column"],
+#   ["ALTER TABLE t ALTER COLUMN a SET NOT NULL", ["actions", 0, "action"], "other"],
+#   ["ALTER TABLE t ALTER COLUMN a SET NOT NULL", ["actions", 0, "sql"], "ALTER COLUMN a SET NOT NULL"],
+#   ["ALTER TABLE ONLY s.t DROP COLUMN c", ["name"], "s.t"],
+#   ["ALTER TABLE IF EXISTS t DROP COLUMN c", ["name"], "t"],
+#   ["DROP TABLE t", ["object"], "TABLE"],
+#   ["DROP TABLE t", ["names"], ["t"]],
+#   ["DROP TABLE IF EXISTS a, s.b", ["names"], ["a", "s.b"]],
+#   ["DROP TABLE IF EXISTS a", ["if_exists"], true],
+#   ["DROP TABLE a CASCADE", ["cascade"], true],
+#   ["DROP TABLE a RESTRICT", ["cascade"], false],
+#   ["DROP VIEW v", ["object"], "VIEW"],
+#   ["DROP INDEX i", ["object"], "INDEX"],
+#   ["DROP INDEX i ON t", ["on_table"], "t"],
+#   ["DROP SCHEMA s", ["object"], "SCHEMA"],
+#   ["DROP SEQUENCE s", ["object"], "SEQUENCE"],
+#   ["DROP DATABASE d", ["object"], "DATABASE"],
+#   ["TRUNCATE t", ["tables"], ["t"]],
+#   ["TRUNCATE TABLE a, b", ["tables"], ["a", "b"]],
+#   ["TRUNCATE ONLY t", ["tables"], ["t"]],
+#   ["COMMENT ON TABLE t IS 'x'", ["object"], "TABLE"],
+#   ["COMMENT ON TABLE t IS 'x'", ["text"], "x"],
+#   ["COMMENT ON COLUMN s.t.c IS 'y'", ["name"], "s.t.c"],
+#   ["COMMENT ON TABLE t IS NULL", ["text"], None],
+#   ["COMMENT ON INDEX i IS 'z'", ["object"], "INDEX"],
+#   ["GRANT ALL ON t TO u", ["keyword"], "grant"],
+#   ["GRANT ALL ON t TO u", ["sql"], "GRANT ALL ON t TO u"],
+#   ["SET x = 1", ["keyword"], "set"],
+#   ["CREATE FUNCTION f() RETURNS int AS $$ SELECT 1; SELECT 2; $$ LANGUAGE sql", ["keyword"], "create"]
+# ])
+def test_ddl_shape(sql, path, expected):
+  assert_eq(_path(first(sql_ast(sql)), path), expected)
+end
+
+# sql_find: [statement, node type, field, expected values of that field]
+# @parametrize([
+#   ["SELECT a FROM t JOIN u ON t.id = u.id", "table", "name", ["t", "u"]],
+#   ["SELECT a FROM t WHERE x IN (SELECT y FROM v)", "table", "name", ["t", "v"]],
+#   ["SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)", "table", "name", ["t", "u"]],
+#   ["SELECT (SELECT max(b) FROM u) FROM t", "table", "name", ["u", "t"]],
+#   ["WITH c AS (SELECT 1 FROM t) SELECT * FROM c", "table", "name", ["t", "c"]],
+#   ["SELECT 1 UNION SELECT 2 FROM t", "table", "name", ["t"]],
+#   ["SELECT * FROM a, b, c", "table", "name", ["a", "b", "c"]],
+#   ["SELECT * FROM (SELECT * FROM a) s", "table", "name", ["a"]],
+#   ["INSERT INTO t (a) SELECT b FROM u", "table", "name", ["u"]],
+#   ["UPDATE t SET a = 1 FROM u WHERE t.id = u.id", "table", "name", ["u"]],
+#   ["DELETE FROM t USING u", "table", "name", ["u"]],
+#   ["SELECT 1", "table", "name", []],
+#   ["SELECT count(*), max(a), lower(b) FROM t", "call", "name", ["count", "max", "lower"]],
+#   ["SELECT a FROM t WHERE f(g(1)) > 0", "call", "name", ["f", "g"]],
+#   ["SELECT $1, ?, :n", "param", "value", ["$1", "?", ":n"]],
+#   ["SELECT a.b, c", "ident", "parts", [["a", "b"], ["c"]]],
+#   ["SELECT CASE WHEN a THEN b END", "case", "else", [None]],
+#   ["SELECT 1; SELECT 2", "select", "distinct", [false, false]],
+#   ["SELECT 1 UNION SELECT 2", "select", "distinct", [false, false]],
+#   ["SELECT 1 UNION SELECT 2", "set_op", "op", ["UNION"]],
+#   ["SELECT a FROM (SELECT b FROM u) s", "subquery", "alias", ["s"]],
+#   ["SELECT a FROM t JOIN u ON t.x = u.x JOIN v ON u.y = v.y", "join", "kind", ["INNER", "INNER"]],
+#   ["SELECT a FROM t WHERE a IN (1, 2) AND b IN (3)", "in", "negated", [false, false]],
+#   ["SELECT x::int, CAST(y AS text)", "cast", "style", ["::", "cast"]],
+#   ["CREATE TABLE a (x INT, y TEXT)", "column_def", "name", ["x", "y"]],
+#   ["CREATE TABLE a (x INT, PRIMARY KEY (x), UNIQUE (x))", "constraint", "kind", ["primary_key", "unique"]],
+#   ["CREATE TABLE a (x INT REFERENCES b (id))", "reference", "table", ["b"]],
+#   ["CREATE TABLE a (x INT DEFAULT now())", "call", "name", ["now"]],
+#   ["ALTER TABLE t ADD COLUMN c INT, DROP COLUMN d", "alter_action", "action", ["add_column", "drop_column"]],
+#   ["ALTER TABLE t ADD COLUMN c INT", "column_def", "name", ["c"]],
+#   ["INSERT INTO t VALUES (1, 2), (3, 4)", "literal", "value", ["1", "2", "3", "4"]],
+#   ["SELECT 1; INSERT INTO t VALUES (2)", "insert", "table", ["t"]],
+#   ["SELECT sum(a) OVER (PARTITION BY b ORDER BY c) FROM t", "window", "name", [None]],
+#   ["SELECT a FROM t ORDER BY a, b DESC", "order_item", "direction", [None, "DESC"]],
+#   ["UPDATE t SET a = 1, b = 2", "assignment", "column", ["a", "b"]],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT (a) DO NOTHING", "on_conflict", "action", ["NOTHING"]],
+#   ["SELECT a AS x, b FROM t", "select_item", "alias", ["x", None]],
+#   ["SELECT a FROM t FOR UPDATE", "locking", "strength", ["UPDATE"]],
+#   ["SELECT a FROM t FETCH FIRST 1 ROWS ONLY", "fetch", "with_ties", [false]],
+#   ["SELECT a FROM t WINDOW w AS (ORDER BY a)", "named_window", "name", ["w"]],
+#   ["WITH a AS (SELECT 1), b AS (SELECT 2) SELECT 1", "cte", "name", ["a", "b"]]
+# ])
+def test_sql_find(sql, type, field, expected):
+  assert_eq(_names(sql_find(sql_ast(sql), type), field), expected)
+end
+
+# Syntax errors raise
+# @parametrize([
+#   ["SELECT"],
+#   ["SELECT FROM t"],
+#   ["SELECT a FROM"],
+#   ["SELECT a FROM t WHERE"],
+#   ["SELECT (1"],
+#   ["SELECT 1)"],
+#   ["SELECT 'abc"],
+#   ["SELECT \"abc"],
+#   ["SELECT `abc"],
+#   ["SELECT $$abc"],
+#   ["SELECT a b c"],
+#   ["SELECT 1 2"],
+#   ["SELECT CASE WHEN a THEN 1"],
+#   ["SELECT CASE END"],
+#   ["SELECT CASE WHEN a END"],
+#   ["SELECT a BETWEEN 1"],
+#   ["SELECT a BETWEEN 1 OR 2"],
+#   ["SELECT a IN 1"],
+#   ["SELECT a IN ("],
+#   ["SELECT a IS 1"],
+#   ["SELECT CAST(a int)"],
+#   ["SELECT CAST(a AS)"],
+#   ["SELECT f(1"],
+#   ["SELECT f(1,)"],
+#   ["SELECT x::"],
+#   ["SELECT sum(a) OVER ("],
+#   ["SELECT sum(a) FILTER (a)"],
+#   ["SELECT a +"],
+#   ["SELECT * FROM a JOIN"],
+#   ["SELECT * FROM a JOIN b ON"],
+#   ["SELECT * FROM (SELECT 1"],
+#   ["SELECT * FROM a LEFT b"],
+#   ["SELECT 1 UNION"],
+#   ["SELECT 1 UNION ALL"],
+#   ["SELECT * FROM t FOR UPDATE OF"],
+#   ["SELECT a FROM t WINDOW w"],
+#   ["SELECT a FROM t WINDOW w AS"],
+#   ["SELECT a FROM t LIMIT"],
+#   ["SELECT a FROM t ORDER BY"],
+#   ["SELECT a FROM t GROUP BY"],
+#   ["SELECT a FROM t FETCH FIRST"],
+#   ["WITH c AS SELECT 1 SELECT 1"],
+#   ["WITH c AS (SELECT 1)"],
+#   ["WITH AS (SELECT 1) SELECT 1"],
+#   ["WITH c (a AS (SELECT 1) SELECT 1"],
+#   ["INSERT INTO"],
+#   ["INSERT INTO t VALUES"],
+#   ["INSERT INTO t VALUES ("],
+#   ["INSERT t VALUES (1)"],
+#   ["INSERT INTO t (a VALUES (1)"],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT"],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT (a) DO"],
+#   ["INSERT INTO t VALUES (1) ON DUPLICATE KEY"],
+#   ["INSERT INTO t VALUES (1) RETURNING"],
+#   ["UPDATE"],
+#   ["UPDATE t"],
+#   ["UPDATE t SET"],
+#   ["UPDATE t SET a"],
+#   ["UPDATE t SET a ="],
+#   ["UPDATE t SET a = 1 WHERE"],
+#   ["DELETE t"],
+#   ["DELETE FROM"],
+#   ["DELETE FROM t WHERE"],
+#   ["DELETE FROM t USING"],
+#   ["CREATE TABLE"],
+#   ["CREATE TABLE a (id INT"],
+#   ["CREATE TABLE a AS"],
+#   ["CREATE INDEX i ON"],
+#   ["CREATE INDEX i ON t"],
+#   ["CREATE INDEX i ON t ("],
+#   ["CREATE VIEW v"],
+#   ["CREATE VIEW v AS"],
+#   ["CREATE VIEW AS SELECT 1"],
+#   ["ALTER TABLE"],
+#   ["DROP TABLE"],
+#   ["DROP TABLE IF EXISTS"],
+#   ["COMMENT ON TABLE t"],
+#   ["COMMENT ON TABLE t IS"],
+#   ["TRUNCATE"],
+#   ["VALUES"],
+#   ["VALUES (1"],
+#   ["SELECT 1; SELECT FROM"]
+# ])
+def test_syntax_error(sql):
+  assert_eq(try: sql_ast(sql) catch: "error", "error")
+end
+
+def _schema_col(sql, table, col):
+  first(filter(first(filter(sql_parse(sql), ->(t): t["name"] == table;))["columns"], ->(c): c["name"] == col;))
+end
+
+# sql_parse columns: [DDL, table, column, field, expected]
+# @parametrize([
+#   ["CREATE TABLE a (x INT)", "a", "x", "type", "INT"],
+#   ["CREATE TABLE a (x INT)", "a", "x", "nullable", true],
+#   ["CREATE TABLE a (x INT NOT NULL)", "a", "x", "nullable", false],
+#   ["CREATE TABLE a (x INT PRIMARY KEY)", "a", "x", "nullable", false],
+#   ["CREATE TABLE a (x INT PRIMARY KEY)", "a", "x", "primary_key", true],
+#   ["CREATE TABLE a (x INT, PRIMARY KEY (x))", "a", "x", "primary_key", true],
+#   ["CREATE TABLE a (x INT, PRIMARY KEY (x))", "a", "x", "nullable", false],
+#   ["CREATE TABLE a (x INT, y INT, PRIMARY KEY (x))", "a", "y", "primary_key", false],
+#   ["CREATE TABLE a (X INT, PRIMARY KEY (x))", "a", "X", "primary_key", true],
+#   ["CREATE TABLE a (x INT UNIQUE)", "a", "x", "unique", true],
+#   ["CREATE TABLE a (x INT, UNIQUE (x))", "a", "x", "unique", true],
+#   ["CREATE TABLE a (x INT, y INT, UNIQUE (x, y))", "a", "x", "unique", false],
+#   ["CREATE TABLE a (x INT)", "a", "x", "unique", false],
+#   ["CREATE TABLE a (x INT AUTO_INCREMENT)", "a", "x", "auto_increment", true],
+#   ["CREATE TABLE a (x INT)", "a", "x", "auto_increment", false],
+#   ["CREATE TABLE a (x INT DEFAULT 1)", "a", "x", "default", "1"],
+#   ["CREATE TABLE a (x INT DEFAULT -1)", "a", "x", "default", "-1"],
+#   ["CREATE TABLE a (x TEXT DEFAULT 'a, b')", "a", "x", "default", "'a, b'"],
+#   ["CREATE TABLE a (x TEXT DEFAULT 'q'::text)", "a", "x", "default", "'q'::text"],
+#   ["CREATE TABLE a (x TS DEFAULT now())", "a", "x", "default", "now()"],
+#   ["CREATE TABLE a (x TS DEFAULT CURRENT_TIMESTAMP)", "a", "x", "default", "CURRENT_TIMESTAMP"],
+#   ["CREATE TABLE a (x TEXT DEFAULT NULL)", "a", "x", "default", "NULL"],
+#   ["CREATE TABLE a (x INT DEFAULT (1 + 2))", "a", "x", "default", "(1 + 2)"],
+#   ["CREATE TABLE a (x DECIMAL DEFAULT 0.00)", "a", "x", "default", "0.00"],
+#   ["CREATE TABLE a (x INT)", "a", "x", "default", None],
+#   ["CREATE TABLE a (x INT DEFAULT nextval('s'::regclass) NOT NULL)", "a", "x", "default", "nextval('s'::regclass)"],
+#   ["CREATE TABLE a (x INT COMMENT 'c')", "a", "x", "comment", "c"],
+#   ["CREATE TABLE a (x INT)", "a", "x", "comment", None],
+#   ["CREATE TABLE a (x INT); COMMENT ON COLUMN a.x IS 'c'", "a", "x", "comment", "c"],
+#   ["CREATE TABLE a (x INT COMMENT 'old'); COMMENT ON COLUMN a.x IS 'new'", "a", "x", "comment", "new"],
+#   ["CREATE TABLE s.a (x INT); COMMENT ON COLUMN s.a.x IS 'c'", "s.a", "x", "comment", "c"],
+#   ["CREATE TABLE s.a (x INT); COMMENT ON COLUMN a.x IS 'c'", "s.a", "x", "comment", "c"],
+#   ["CREATE TABLE a (x INT REFERENCES b (id))", "a", "x", "references", "b.id"],
+#   ["CREATE TABLE a (x INT REFERENCES b)", "a", "x", "references", "b"],
+#   ["CREATE TABLE a (x INT, FOREIGN KEY (x) REFERENCES s.b (id))", "a", "x", "references", "s.b.id"],
+#   ["CREATE TABLE a (x INT, y INT, FOREIGN KEY (x, y) REFERENCES b (p, q))", "a", "y", "references", "b.q"],
+#   ["CREATE TABLE a (x INT)", "a", "x", "references", None],
+#   ["CREATE TABLE a (id INT); ALTER TABLE a ADD CONSTRAINT pk PRIMARY KEY (id)", "a", "id", "primary_key", true],
+#   ["CREATE TABLE a (id INT); ALTER TABLE ONLY public.a ADD CONSTRAINT pk PRIMARY KEY (id)", "a", "id", "primary_key", true],
+#   ["CREATE TABLE a (u INT); ALTER TABLE a ADD CONSTRAINT fk FOREIGN KEY (u) REFERENCES users (id)", "a", "u", "references", "users.id"],
+#   ["CREATE TABLE a (u INT); ALTER TABLE a ADD UNIQUE (u)", "a", "u", "unique", true],
+#   ["CREATE TABLE a (u INT); ALTER TABLE b ADD PRIMARY KEY (u)", "a", "u", "primary_key", false],
+#   ["CREATE TABLE a (x TIMESTAMP WITH TIME ZONE)", "a", "x", "type", "TIMESTAMP WITH TIME ZONE"],
+#   ["CREATE TABLE a (x DECIMAL(10, 2))", "a", "x", "type", "DECIMAL(10, 2)"]
+# ])
+def test_schema_column(sql, table, col, field, expected):
+  assert_eq(_schema_col(sql, table, col)[field], expected)
+end
+
+# sql_parse tables: [DDL, table, field, expected]
+# @parametrize([
+#   ["CREATE TABLE a (x INT, y INT, PRIMARY KEY (x, y))", "a", "primary_key", ["x", "y"]],
+#   ["CREATE TABLE a (x INT PRIMARY KEY, y INT)", "a", "primary_key", ["x"]],
+#   ["CREATE TABLE a (x INT)", "a", "primary_key", []],
+#   ["CREATE TABLE a (x INT, UNIQUE (x), UNIQUE (x, y))", "a", "unique", [["x"], ["x", "y"]]],
+#   ["CREATE TABLE a (x INT)", "a", "unique", []],
+#   ["CREATE TABLE a (x INT REFERENCES b (id))", "a", "foreign_keys", [{"columns": ["x"], "ref_table": "b", "ref_columns": ["id"]}]],
+#   ["CREATE TABLE a (x INT, FOREIGN KEY (x) REFERENCES b (id))", "a", "foreign_keys", [{"columns": ["x"], "ref_table": "b", "ref_columns": ["id"]}]],
+#   ["CREATE TABLE a (x INT)", "a", "foreign_keys", []],
+#   ["CREATE TABLE a (x INT) COMMENT='c'", "a", "comment", "c"],
+#   ["CREATE TABLE a (x INT); COMMENT ON TABLE a IS 'c'", "a", "comment", "c"],
+#   ["CREATE TABLE a (x INT)", "a", "comment", None],
+#   ["CREATE TABLE a (x INT COMMENT 'p'); COMMENT ON TABLE a IS 't'", "a", "comment", "t"],
+#   ["CREATE TABLE s.a (x INT); COMMENT ON TABLE a IS 't'", "s.a", "comment", "t"],
+#   ["CREATE TABLE a (x INT, y TEXT)", "a", "name", "a"],
+#   ["CREATE TABLE a (x INT, y TEXT, z INT)", "a", "columns|name", ["x", "y", "z"]]
+# ])
+def test_schema_table(sql, table, field, expected):
+  let t = first(filter(sql_parse(sql), ->(x): x["name"] == table;))
+  | if (field == "columns|name"): assert_eq(map(t["columns"], ->(c): c["name"];), expected) else: assert_eq(t[field], expected)
+end
+
+# sql_parse skips everything but table definitions
+# @parametrize([
+#   ["SELECT 1", 0],
+#   ["INSERT INTO t VALUES (1)", 0],
+#   ["UPDATE t SET a = 1", 0],
+#   ["DELETE FROM t", 0],
+#   ["DROP TABLE a", 0],
+#   ["GRANT ALL ON t TO u", 0],
+#   ["BEGIN; COMMIT", 0],
+#   ["CREATE INDEX i ON t (a)", 0],
+#   ["CREATE VIEW v AS SELECT 1", 0],
+#   ["CREATE TABLE a AS SELECT 1", 0],
+#   ["CREATE TABLE a LIKE b", 0],
+#   ["CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql", 0],
+#   ["ALTER TABLE a ADD COLUMN c INT", 0],
+#   ["COMMENT ON TABLE a IS 'x'", 0],
+#   ["", 0],
+#   ["-- nothing", 0],
+#   ["CREATE TABLE a (x INT)", 1],
+#   ["CREATE TEMP TABLE IF NOT EXISTS a (x INT)", 1],
+#   ["CREATE TABLE a (x INT); SELECT 1; CREATE TABLE b (y INT)", 2],
+#   ["CREATE TABLE a (x INT);\nCREATE TABLE b (y INT);\nCREATE TABLE c (z INT)", 3],
+#   ["CREATE TABLE a (x INT); DROP TABLE a; CREATE TABLE a (y INT)", 2]
+# ])
+def test_schema_table_count(sql, expected):
+  assert_eq(len(sql_parse(sql)), expected)
+end
+
+# sql_to_markdown: [DDL, expected Markdown]
+# @parametrize([
+#   ["", ""],
+#   ["SELECT 1", ""],
+#   ["CREATE TABLE a (x INT)", "## a\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `INT` | YES |  |  |  |"],
+#   ["CREATE TABLE a ()", "## a\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|"],
+#   ["CREATE TABLE a (x INT NOT NULL DEFAULT 0) COMMENT='Tbl'", "## a\n\nTbl\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `INT` | NO | `0` |  |  |"],
+#   ["CREATE TABLE a (x INT PRIMARY KEY, y INT UNIQUE, z INT REFERENCES b (id))", "## a\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `INT` | NO |  | PK |  |\n| `y` | `INT` | YES |  | UK |  |\n| `z` | `INT` | YES |  | FK: b.id |  |"],
+#   ["CREATE TABLE a (x INT PRIMARY KEY, UNIQUE (x))", "## a\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `INT` | NO |  | PK, UK |  |"],
+#   ["CREATE TABLE a (x TEXT DEFAULT 'a|b' COMMENT 'p|q')", "## a\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `TEXT` | YES | `'a\\|b'` |  | p\\|q |"],
+#   ["CREATE TABLE a (x TEXT COMMENT 'l1\nl2')", "## a\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `TEXT` | YES |  |  | l1 l2 |"],
+#   ["CREATE TABLE s.a (x INT)", "## s.a\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `INT` | YES |  |  |  |"],
+#   ["CREATE TABLE a (x INT); CREATE TABLE b (y INT)", "## a\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `INT` | YES |  |  |  |\n\n## b\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `y` | `INT` | YES |  |  |  |"],
+#   ["CREATE TABLE a (x INT); COMMENT ON TABLE a IS 'T'; COMMENT ON COLUMN a.x IS 'C'", "## a\n\nT\n\n| Column | Type | Null | Default | Key | Comment |\n|---|---|---|---|---|---|\n| `x` | `INT` | YES |  |  | C |"]
+# ])
+def test_markdown_output_cases(sql, expected):
+  assert_eq(sql_to_markdown(sql), expected)
+end
+
+# ===========================================================================
+# Extended dialect coverage
+# ===========================================================================
+
+# Printer: dialect constructs print as their canonical form
+# @parametrize([
+#   ["SELECT a FROM t WHERE x = ANY(ARRAY[1,2,3])", "SELECT a FROM t WHERE x = ANY (ARRAY[1, 2, 3])"],
+#   ["SELECT ARRAY[1,2,3]", "SELECT ARRAY[1, 2, 3]"],
+#   ["SELECT arr[1] FROM t", "SELECT arr[1] FROM t"],
+#   ["SELECT a FROM t WHERE d > now() - INTERVAL '1 day'", "SELECT a FROM t WHERE d > now() - INTERVAL '1 day'"],
+#   ["SELECT a FROM t WHERE d > now() - INTERVAL '1' DAY", "SELECT a FROM t WHERE d > now() - INTERVAL '1' DAY"],
+#   ["SELECT 'a' 'b'", "SELECT 'ab'"],
+#   ["SELECT E'a\\nb'", "SELECT 'a\nb'"],
+#   ["SELECT N'abc'", "SELECT N'abc'"],
+#   ["SELECT x'FF', B'101'", "SELECT X'FF', B'101'"],
+#   ["SELECT a FROM t GROUP BY a WITH ROLLUP", "SELECT a FROM t GROUP BY a WITH ROLLUP"],
+#   ["SELECT a FROM t LOCK IN SHARE MODE", "SELECT a FROM t LOCK IN SHARE MODE"],
+#   ["SELECT TOP 10 a FROM t", "SELECT TOP 10 a FROM t"],
+#   ["SELECT a FROM t WITH (NOLOCK)", "SELECT a FROM t WITH (NOLOCK)"],
+#   ["SELECT a FROM t TABLESAMPLE SYSTEM (10)", "SELECT a FROM t TABLESAMPLE SYSTEM (10)"],
+#   ["SELECT a FROM t WHERE a = ALL (SELECT b FROM u)", "SELECT a FROM t WHERE a = ALL (SELECT b FROM u)"],
+#   ["SELECT a FROM t WHERE a > SOME (SELECT b FROM u)", "SELECT a FROM t WHERE a > SOME (SELECT b FROM u)"],
+#   ["SELECT COUNT(*) FILTER (WHERE a) OVER () FROM t", "SELECT COUNT(*) FILTER (WHERE a) OVER () FROM t"],
+#   ["SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM t", "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM t"],
+#   ["SELECT a COLLATE \"C\" FROM t", "SELECT a COLLATE \"C\" FROM t"],
+#   ["SELECT a AT TIME ZONE 'UTC' FROM t", "SELECT a AT TIME ZONE 'UTC' FROM t"],
+#   ["SELECT a::int FROM t WHERE b ~ 'x' AND c !~* 'y'", "SELECT a::int FROM t WHERE b ~ 'x' AND c !~* 'y'"],
+#   ["SELECT a FROM t WHERE (a, b) IN ((1, 2), (3, 4))", "SELECT a FROM t WHERE (a, b) IN ((1, 2), (3, 4))"],
+#   ["SELECT a FROM t WHERE a IS NOT DISTINCT FROM b", "SELECT a FROM t WHERE a IS NOT DISTINCT FROM b"],
+#   ["SELECT CASE WHEN a THEN b END AS c FROM t", "SELECT CASE WHEN a THEN b END AS c FROM t"],
+#   ["SELECT * FROM t1 JOIN t2 ON t1.a = t2.a AND t1.b = t2.b WHERE t1.c IS NULL", "SELECT * FROM t1 JOIN t2 ON t1.a = t2.a AND t1.b = t2.b WHERE t1.c IS NULL"],
+#   ["SELECT * FROM a CROSS APPLY b", "SELECT * FROM a CROSS APPLY b"],
+#   ["SELECT * FROM a OUTER APPLY (SELECT 1) x", "SELECT * FROM a OUTER APPLY (SELECT 1) AS x"],
+#   ["SELECT * FROM a STRAIGHT_JOIN b ON a.x = b.x", "SELECT * FROM a STRAIGHT_JOIN b ON a.x = b.x"],
+#   ["SELECT json_agg(a ORDER BY b) FROM t", "SELECT json_agg(a ORDER BY b) FROM t"],
+#   ["SELECT string_agg(a, ',' ORDER BY b) FROM t", "SELECT string_agg(a, ',' ORDER BY b) FROM t"],
+#   ["SELECT SUM(a) OVER (ORDER BY b RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW) FROM t", "SELECT SUM(a) OVER (ORDER BY b RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW) FROM t"],
+#   ["SELECT a FROM t UNION SELECT b FROM u ORDER BY 1", "SELECT a FROM t UNION SELECT b FROM u ORDER BY 1"],
+#   ["WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c", "WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c"],
+#   ["WITH c AS (SELECT 1) UPDATE t SET a = 1", "WITH c AS (SELECT 1) UPDATE t SET a = 1"],
+#   ["WITH c AS (SELECT 1) DELETE FROM t", "WITH c AS (SELECT 1) DELETE FROM t"],
+#   ["WITH RECURSIVE c AS (SELECT 1) DELETE FROM t USING c", "WITH RECURSIVE c AS (SELECT 1) DELETE FROM t USING c"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT pk DO NOTHING", "INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT pk DO NOTHING"],
+#   ["INSERT INTO t SET a = 1", "INSERT INTO t SET a = 1"],
+#   ["UPDATE t SET (a, b) = (1, 2)", "UPDATE t SET (a, b) = (1, 2)"],
+#   ["UPDATE t SET (a, b) = (SELECT 1, 2)", "UPDATE t SET (a, b) = (SELECT 1, 2)"],
+#   ["UPDATE t SET a = 1 ORDER BY b LIMIT 1", "UPDATE t SET a = 1 ORDER BY b LIMIT 1"],
+#   ["DELETE FROM t ORDER BY b LIMIT 1", "DELETE FROM t ORDER BY b LIMIT 1"],
+#   ["CREATE TABLE a (id SERIAL PRIMARY KEY, n TEXT)", "CREATE TABLE a (\n  id SERIAL PRIMARY KEY,\n  n TEXT\n)"],
+#   ["CREATE TABLE a (id INT GENERATED ALWAYS AS (b + 1) STORED)", "CREATE TABLE a (\n  id INT GENERATED ALWAYS AS (b + 1) STORED\n)"],
+#   ["CREATE TABLE a (id INT, PRIMARY KEY (id)) PARTITION BY RANGE (id)", "CREATE TABLE a (\n  id INT,\n  PRIMARY KEY (id)\n) PARTITION BY RANGE(id)"],
+#   ["CREATE TABLE a (id INT, EXCLUDE USING gist (c WITH &&))", "CREATE TABLE a (\n  id INT,\n  EXCLUDE USING gist(c WITH &&)\n)"],
+#   ["CREATE TABLE a (LIKE b INCLUDING ALL)", "CREATE TABLE a (\n  LIKE b INCLUDING ALL\n)"],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4", "CREATE TABLE a (\n  id INT\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"],
+#   ["CREATE TABLE a (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) ENGINE=InnoDB", "CREATE TABLE a (\n  id INT NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (id)\n) ENGINE=InnoDB"],
+#   ["CREATE TABLE a (c INT DEFAULT 1 ON UPDATE CURRENT_TIMESTAMP)", "CREATE TABLE a (\n  c INT DEFAULT 1 ON UPDATE CURRENT_TIMESTAMP\n)"],
+#   ["CREATE TYPE mood AS ENUM ('a', 'b')", "CREATE TYPE mood AS ENUM ('a', 'b')"],
+#   ["CREATE SEQUENCE s START 1", "CREATE SEQUENCE s START 1"],
+#   ["CREATE SCHEMA s", "CREATE SCHEMA s"],
+#   ["CREATE EXTENSION IF NOT EXISTS pgcrypto", "CREATE EXTENSION IF NOT EXISTS pgcrypto"],
+#   ["CREATE TRIGGER t BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION f()", "CREATE TRIGGER t BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION f()"],
+#   ["CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'", "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'"],
+#   ["CREATE INDEX i ON t (a) INCLUDE (b)", "CREATE INDEX i ON t (a) INCLUDE (b)"],
+#   ["CREATE INDEX i ON t (a COLLATE \"C\" DESC)", "CREATE INDEX i ON t (a COLLATE \"C\" DESC)"],
+#   ["ALTER TABLE t ALTER COLUMN a TYPE int USING a::int", "ALTER TABLE t ALTER COLUMN a TYPE int USING a::int"],
+#   ["ALTER TABLE t ADD COLUMN a INT AFTER b", "ALTER TABLE t ADD COLUMN a INT AFTER b"],
+#   ["ALTER TABLE t ENABLE ROW LEVEL SECURITY", "ALTER TABLE t ENABLE ROW LEVEL SECURITY"],
+#   ["ALTER TABLE t OWNER TO u", "ALTER TABLE t OWNER TO u"],
+#   ["DROP FUNCTION f(int)", "DROP FUNCTION f(int)"],
+#   ["EXPLAIN SELECT 1", "EXPLAIN SELECT 1"],
+#   ["BEGIN", "BEGIN"],
+#   ["COMMIT", "COMMIT"],
+#   ["SET search_path TO public", "SET search_path TO public"],
+#   ["USE db", "USE db"],
+#   ["SHOW TABLES", "SHOW TABLES"],
+#   ["GRANT SELECT ON t TO u", "GRANT SELECT ON t TO u"],
+#   ["VACUUM", "VACUUM"],
+#   ["SELECT 1;;", "SELECT 1"],
+#   ["SELECT @@version", "SELECT @@version"],
+#   ["SELECT @x := 1", "SELECT @x := 1"],
+#   ["SELECT `a` FROM `db`.`t`", "SELECT `a` FROM `db`.`t`"],
+#   ["SELECT \"a\" FROM \"s\".\"t\"", "SELECT \"a\" FROM \"s\".\"t\""],
+#   ["SELECT [a] FROM [dbo].[t]", "SELECT [a] FROM [dbo].[t]"],
+#   ["SELECT 1e10, 1E-5, 0b101", "SELECT 1e10, 1E-5, 0b101"],
+#   ["SELECT a FROM t -- trailing", "SELECT a FROM t"],
+#   ["SELECT a /* c */ FROM t", "SELECT a FROM t"],
+#   ["SELECT a # mysql comment", "SELECT a"],
+#   ["SELECT a FROM t WHERE a LIKE 'x' || b", "SELECT a FROM t WHERE a LIKE 'x' || b"],
+#   ["SELECT -1, - 1, +1", "SELECT -1, -1, +1"],
+#   ["SELECT a FROM t FETCH FIRST ROW ONLY", "SELECT a FROM t FETCH FIRST ROW ONLY"],
+#   ["SELECT a FROM t WHERE a = $1::int", "SELECT a FROM t WHERE a = $1::int"],
+#   ["SELECT $$a$$", "SELECT 'a'"],
+#   ["SELECT $tag$a$tag$", "SELECT 'a'"],
+#   ["SELECT a FROM t WHERE a->>'k' = 'v'", "SELECT a FROM t WHERE a ->> 'k' = 'v'"],
+#   ["SELECT a FROM t WHERE a @> '{\"k\":1}'::jsonb", "SELECT a FROM t WHERE a @> '{\"k\":1}'::jsonb"],
+#   ["SELECT a FROM unnest(ARRAY[1,2]) AS u(x)", "SELECT a FROM unnest(ARRAY[1, 2]) AS u (x)"],
+#   ["SELECT * FROM t, LATERAL f(t.a)", "SELECT * FROM t, LATERAL f(t.a)"],
+#   ["SELECT a FROM t NATURAL LEFT JOIN u", "SELECT a FROM t NATURAL LEFT JOIN u"],
+#   ["SELECT a FROM t WHERE EXISTS (SELECT 1) AND NOT EXISTS (SELECT 2)", "SELECT a FROM t WHERE EXISTS (SELECT 1) AND NOT EXISTS (SELECT 2)"],
+#   ["VALUES (1) UNION VALUES (2)", "VALUES (1) UNION VALUES (2)"],
+#   ["(SELECT 1)", "(SELECT 1)"],
+#   ["((SELECT 1))", "(SELECT 1)"],
+#   ["SELECT 1 FROM (SELECT 1) AS x JOIN (SELECT 2) AS y ON TRUE", "SELECT 1 FROM (SELECT 1) AS x JOIN (SELECT 2) AS y ON TRUE"],
+#   ["SELECT a COLLATE pg_catalog.\"default\" FROM t", "SELECT a COLLATE pg_catalog.\"default\" FROM t"],
+#   ["SELECT a[1][2], (ARRAY[1,2])[1]", "SELECT a[1][2], (ARRAY[1, 2])[1]"],
+#   ["SELECT ARRAY(SELECT 1)", "SELECT ARRAY(SELECT 1)"],
+#   ["SELECT 'x' AS \"y\", 'a'", "SELECT 'x' AS \"y\", 'a'"],
+#   ["SELECT x FROM t WHERE y = ANY (SELECT 1)", "SELECT x FROM t WHERE y = ANY (SELECT 1)"],
+#   ["SELECT TOP (5) PERCENT WITH TIES a FROM t ORDER BY a", "SELECT TOP (5) PERCENT WITH TIES a FROM t ORDER BY a"],
+#   ["SELECT DISTINCT TOP 3 a FROM t", "SELECT DISTINCT TOP 3 a FROM t"],
+#   ["SELECT a FROM t WITH (NOLOCK, INDEX(i))", "SELECT a FROM t WITH (NOLOCK, INDEX(i))"],
+#   ["SELECT a FROM t AS x TABLESAMPLE BERNOULLI (5) REPEATABLE (1)", "SELECT a FROM t AS x TABLESAMPLE BERNOULLI (5) REPEATABLE (1)"],
+#   ["SELECT a FROM t GROUP BY a, b WITH ROLLUP", "SELECT a FROM t GROUP BY a, b WITH ROLLUP"],
+#   ["SELECT * FROM a CROSS APPLY f(a.x) AS g", "SELECT * FROM a CROSS APPLY f(a.x) AS g"],
+#   ["UPDATE t SET (a, b) = (1, 2), c = 3 WHERE d", "UPDATE t SET (a, b) = (1, 2), c = 3 WHERE d"],
+#   ["DELETE FROM t WHERE a ORDER BY b DESC LIMIT 2", "DELETE FROM t WHERE a ORDER BY b DESC LIMIT 2"],
+#   ["INSERT INTO t SET a = 1, b = 2", "INSERT INTO t SET a = 1, b = 2"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT pk DO UPDATE SET a = 2", "INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT pk DO UPDATE SET a = 2"],
+#   ["WITH c AS (SELECT 1) INSERT INTO t (a) SELECT * FROM c RETURNING a", "WITH c AS (SELECT 1) INSERT INTO t (a) SELECT * FROM c RETURNING a"],
+#   ["WITH a AS (SELECT 1), b AS (SELECT 2) UPDATE t SET x = 1 FROM a, b", "WITH a AS (SELECT 1), b AS (SELECT 2) UPDATE t SET x = 1 FROM a, b"],
+#   ["CREATE TABLE a (x INT, EXCLUDE USING gist (c WITH &&), CHECK (x > 0))", "CREATE TABLE a (\n  x INT,\n  EXCLUDE USING gist(c WITH &&),\n  CHECK (x > 0)\n)"],
+#   ["CREATE UNIQUE INDEX i ON t USING btree (a) INCLUDE (b, c) WHERE a > 0", "CREATE UNIQUE INDEX i ON t USING BTREE (a) INCLUDE (b, c) WHERE a > 0"],
+#   ["SELECT a FROM unnest(ARRAY[1,2]) AS u(x), generate_series(1, 2) g(n)", "SELECT a FROM unnest(ARRAY[1, 2]) AS u (x), generate_series(1, 2) AS g (n)"]
+# ])
+def test_stringify_canonical_dialects(sql, expected):
+  assert_eq(sql_stringify(first(sql_ast(sql))), expected)
+end
+
+# Printer: canonical dialect forms are fixed points
+# @parametrize([
+#   ["SELECT a FROM t WHERE x = ANY (ARRAY[1, 2, 3])"],
+#   ["SELECT ARRAY[1, 2, 3]"],
+#   ["SELECT arr[1] FROM t"],
+#   ["SELECT a FROM t WHERE d > now() - INTERVAL '1 day'"],
+#   ["SELECT a FROM t WHERE d > now() - INTERVAL '1' DAY"],
+#   ["SELECT 'ab'"],
+#   ["SELECT 'a\nb'"],
+#   ["SELECT N'abc'"],
+#   ["SELECT X'FF', B'101'"],
+#   ["SELECT a FROM t GROUP BY a WITH ROLLUP"],
+#   ["SELECT a FROM t LOCK IN SHARE MODE"],
+#   ["SELECT TOP 10 a FROM t"],
+#   ["SELECT a FROM t WITH (NOLOCK)"],
+#   ["SELECT a FROM t TABLESAMPLE SYSTEM (10)"],
+#   ["SELECT a FROM t WHERE a = ALL (SELECT b FROM u)"],
+#   ["SELECT a FROM t WHERE a > SOME (SELECT b FROM u)"],
+#   ["SELECT COUNT(*) FILTER (WHERE a) OVER () FROM t"],
+#   ["SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM t"],
+#   ["SELECT a COLLATE \"C\" FROM t"],
+#   ["SELECT a AT TIME ZONE 'UTC' FROM t"],
+#   ["SELECT a::int FROM t WHERE b ~ 'x' AND c !~* 'y'"],
+#   ["SELECT a FROM t WHERE (a, b) IN ((1, 2), (3, 4))"],
+#   ["SELECT a FROM t WHERE a IS NOT DISTINCT FROM b"],
+#   ["SELECT CASE WHEN a THEN b END AS c FROM t"],
+#   ["SELECT * FROM t1 JOIN t2 ON t1.a = t2.a AND t1.b = t2.b WHERE t1.c IS NULL"],
+#   ["SELECT * FROM a CROSS APPLY b"],
+#   ["SELECT * FROM a OUTER APPLY (SELECT 1) AS x"],
+#   ["SELECT * FROM a STRAIGHT_JOIN b ON a.x = b.x"],
+#   ["SELECT json_agg(a ORDER BY b) FROM t"],
+#   ["SELECT string_agg(a, ',' ORDER BY b) FROM t"],
+#   ["SELECT SUM(a) OVER (ORDER BY b RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW) FROM t"],
+#   ["SELECT a FROM t UNION SELECT b FROM u ORDER BY 1"],
+#   ["WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c"],
+#   ["WITH c AS (SELECT 1) UPDATE t SET a = 1"],
+#   ["WITH c AS (SELECT 1) DELETE FROM t"],
+#   ["WITH RECURSIVE c AS (SELECT 1) DELETE FROM t USING c"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT pk DO NOTHING"],
+#   ["INSERT INTO t SET a = 1"],
+#   ["UPDATE t SET (a, b) = (1, 2)"],
+#   ["UPDATE t SET (a, b) = (SELECT 1, 2)"],
+#   ["UPDATE t SET a = 1 ORDER BY b LIMIT 1"],
+#   ["DELETE FROM t ORDER BY b LIMIT 1"],
+#   ["CREATE TABLE a (\n  id SERIAL PRIMARY KEY,\n  n TEXT\n)"],
+#   ["CREATE TABLE a (\n  id INT GENERATED ALWAYS AS (b + 1) STORED\n)"],
+#   ["CREATE TABLE a (\n  id INT,\n  PRIMARY KEY (id)\n) PARTITION BY RANGE(id)"],
+#   ["CREATE TABLE a (\n  id INT,\n  EXCLUDE USING gist(c WITH &&)\n)"],
+#   ["CREATE TABLE a (\n  LIKE b INCLUDING ALL\n)"],
+#   ["CREATE TABLE a (\n  id INT\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"],
+#   ["CREATE TABLE a (\n  id INT NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (id)\n) ENGINE=InnoDB"],
+#   ["CREATE TABLE a (\n  c INT DEFAULT 1 ON UPDATE CURRENT_TIMESTAMP\n)"],
+#   ["CREATE TYPE mood AS ENUM ('a', 'b')"],
+#   ["CREATE SEQUENCE s START 1"],
+#   ["CREATE SCHEMA s"],
+#   ["CREATE EXTENSION IF NOT EXISTS pgcrypto"],
+#   ["CREATE TRIGGER t BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION f()"],
+#   ["CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'"],
+#   ["CREATE INDEX i ON t (a) INCLUDE (b)"],
+#   ["CREATE INDEX i ON t (a COLLATE \"C\" DESC)"],
+#   ["ALTER TABLE t ALTER COLUMN a TYPE int USING a::int"],
+#   ["ALTER TABLE t ADD COLUMN a INT AFTER b"],
+#   ["ALTER TABLE t ENABLE ROW LEVEL SECURITY"],
+#   ["ALTER TABLE t OWNER TO u"],
+#   ["DROP FUNCTION f(int)"],
+#   ["EXPLAIN SELECT 1"],
+#   ["BEGIN"],
+#   ["COMMIT"],
+#   ["SET search_path TO public"],
+#   ["USE db"],
+#   ["SHOW TABLES"],
+#   ["GRANT SELECT ON t TO u"],
+#   ["VACUUM"],
+#   ["SELECT 1"],
+#   ["SELECT @@version"],
+#   ["SELECT @x := 1"],
+#   ["SELECT `a` FROM `db`.`t`"],
+#   ["SELECT \"a\" FROM \"s\".\"t\""],
+#   ["SELECT [a] FROM [dbo].[t]"],
+#   ["SELECT 1e10, 1E-5, 0b101"],
+#   ["SELECT a FROM t"],
+#   ["SELECT a FROM t"],
+#   ["SELECT a"],
+#   ["SELECT a FROM t WHERE a LIKE 'x' || b"],
+#   ["SELECT -1, -1, +1"],
+#   ["SELECT a FROM t FETCH FIRST ROW ONLY"],
+#   ["SELECT a FROM t WHERE a = $1::int"],
+#   ["SELECT 'a'"],
+#   ["SELECT 'a'"],
+#   ["SELECT a FROM t WHERE a ->> 'k' = 'v'"],
+#   ["SELECT a FROM t WHERE a @> '{\"k\":1}'::jsonb"],
+#   ["SELECT a FROM unnest(ARRAY[1, 2]) AS u (x)"],
+#   ["SELECT * FROM t, LATERAL f(t.a)"],
+#   ["SELECT a FROM t NATURAL LEFT JOIN u"],
+#   ["SELECT a FROM t WHERE EXISTS (SELECT 1) AND NOT EXISTS (SELECT 2)"],
+#   ["VALUES (1) UNION VALUES (2)"],
+#   ["(SELECT 1)"],
+#   ["(SELECT 1)"],
+#   ["SELECT 1 FROM (SELECT 1) AS x JOIN (SELECT 2) AS y ON TRUE"],
+#   ["SELECT a COLLATE pg_catalog.\"default\" FROM t"],
+#   ["SELECT a[1][2], (ARRAY[1, 2])[1]"],
+#   ["SELECT ARRAY(SELECT 1)"],
+#   ["SELECT 'x' AS \"y\", 'a'"],
+#   ["SELECT x FROM t WHERE y = ANY (SELECT 1)"],
+#   ["SELECT TOP (5) PERCENT WITH TIES a FROM t ORDER BY a"],
+#   ["SELECT DISTINCT TOP 3 a FROM t"],
+#   ["SELECT a FROM t WITH (NOLOCK, INDEX(i))"],
+#   ["SELECT a FROM t AS x TABLESAMPLE BERNOULLI (5) REPEATABLE (1)"],
+#   ["SELECT a FROM t GROUP BY a, b WITH ROLLUP"],
+#   ["SELECT * FROM a CROSS APPLY f(a.x) AS g"],
+#   ["UPDATE t SET (a, b) = (1, 2), c = 3 WHERE d"],
+#   ["DELETE FROM t WHERE a ORDER BY b DESC LIMIT 2"],
+#   ["INSERT INTO t SET a = 1, b = 2"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT pk DO UPDATE SET a = 2"],
+#   ["WITH c AS (SELECT 1) INSERT INTO t (a) SELECT * FROM c RETURNING a"],
+#   ["WITH a AS (SELECT 1), b AS (SELECT 2) UPDATE t SET x = 1 FROM a, b"],
+#   ["CREATE TABLE a (\n  x INT,\n  EXCLUDE USING gist(c WITH &&),\n  CHECK (x > 0)\n)"],
+#   ["CREATE UNIQUE INDEX i ON t USING BTREE (a) INCLUDE (b, c) WHERE a > 0"],
+#   ["SELECT a FROM unnest(ARRAY[1, 2]) AS u (x), generate_series(1, 2) AS g (n)"]
+# ])
+def test_stringify_dialects_idempotent(sql):
+  assert_eq(sql_stringify(first(sql_ast(sql))), sql)
+end
+
+def _expr_of2(sql):
+  first(first(sql_ast("SELECT " + sql))["columns"])["expr"]
+end
+
+# New expression shapes: [expression, path, expected]
+# @parametrize([
+#   ["ARRAY[1, 2]", ["items", 1, "value"], "2"],
+#   ["ARRAY[]", ["items"], []],
+#   ["ARRAY[[1, 2], [3]]", ["items", 1, "items", 0, "value"], "3"],
+#   ["ARRAY[1]", ["type"], "array"],
+#   ["arr[1]", ["type"], "subscript"],
+#   ["arr[1]", ["index", "value"], "1"],
+#   ["a[1:2]", ["upper", "value"], "2"],
+#   ["a[1]", ["upper"], None],
+#   ["a[1][2]", ["expr", "type"], "subscript"],
+#   ["(ARRAY[1])[1]", ["expr", "paren"], true],
+#   ["x::int[]", ["data_type"], "int[]"],
+#   ["ARRAY(SELECT 1)", ["name"], "ARRAY"],
+#   ["ARRAY(SELECT 1)", ["args", 0, "type"], "select"],
+#   ["x = ANY(ARRAY[1])", ["right", "quantifier"], "ANY"],
+#   ["x = ALL (SELECT 1)", ["right", "query", "type"], "select"],
+#   ["x = SOME(ARRAY[1])", ["right", "expr", "type"], "array"],
+#   ["x > ANY (SELECT 1)", ["op"], ">"],
+#   ["a COLLATE \"C\"", ["collation"], "C"],
+#   ["a COLLATE pg_catalog.\"default\"", ["collation"], "pg_catalog.default"],
+#   ["a COLLATE c || b", ["op"], "||"],
+#   ["a COLLATE c", ["expr", "parts"], ["a"]],
+#   ["a AT TIME ZONE 'UTC'", ["op"], "AT TIME ZONE"],
+#   ["a AT TIME ZONE 'UTC' + 1", ["op"], "+"],
+#   ["a AT TIME ZONE 'UTC' + 1", ["left", "op"], "AT TIME ZONE"],
+#   ["@x := 1", ["op"], ":="],
+#   ["E'a\\nb'", ["value"], "a\nb"],
+#   ["E'it\\'s'", ["value"], "it's"],
+#   ["E'it''s'", ["value"], "it's"],
+#   ["E'a\\\\b'", ["value"], "a\\b"],
+#   ["N'x'", ["prefix"], "N"],
+#   ["X'FF'", ["prefix"], "X"],
+#   ["B'1'", ["prefix"], "B"],
+#   ["'x'", ["prefix"], None],
+#   ["'a' 'b' 'c'", ["value"], "abc"],
+#   ["$$a'b$$", ["value"], "a'b"],
+#   ["$t$a$$b$t$", ["value"], "a$$b"],
+#   ["$$$$", ["value"], ""],
+#   ["0b101", ["value"], "0b101"],
+#   ["0B1", ["value"], "0B1"],
+#   ["0x1F", ["value"], "0x1F"],
+#   ["agg(a ORDER BY b DESC)", ["order_by", 0, "direction"], "DESC"],
+#   ["agg(a, b ORDER BY c, d)", ["order_by", 1, "expr", "parts"], ["d"]],
+#   ["f(a)", ["order_by"], []],
+#   ["percentile_cont(0.5) WITHIN GROUP (ORDER BY a)", ["within_group", 0, "expr", "parts"], ["a"]],
+#   ["f(a)", ["within_group"], []],
+#   ["percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FILTER (WHERE b)", ["filter", "parts"], ["b"]]
+# ])
+def test_expression_shape_dialects(sql, path, expected):
+  assert_eq(_path(_expr_of2(sql), path), expected)
+end
+
+# New statement shapes: [statement, path, expected]
+# @parametrize([
+#   ["SELECT TOP 5 a", ["top", "count", "value"], "5"],
+#   ["SELECT TOP 5 PERCENT a", ["top", "percent"], true],
+#   ["SELECT TOP 5 WITH TIES a", ["top", "with_ties"], true],
+#   ["SELECT TOP (5) a", ["top", "count", "paren"], true],
+#   ["SELECT TOP 5 a", ["top", "percent"], false],
+#   ["SELECT a", ["top"], None],
+#   ["SELECT top FROM t", ["columns", 0, "expr", "parts"], ["top"]],
+#   ["SELECT DISTINCT TOP 3 a", ["distinct"], true],
+#   ["SELECT DISTINCT TOP 3 a", ["top", "count", "value"], "3"],
+#   ["SELECT a FROM t GROUP BY a WITH ROLLUP", ["group_by_modifier"], "WITH ROLLUP"],
+#   ["SELECT a FROM t GROUP BY a", ["group_by_modifier"], None],
+#   ["SELECT a FROM t LOCK IN SHARE MODE", ["locking", 0, "strength"], "LOCK IN SHARE MODE"],
+#   ["SELECT a FROM t LOCK IN SHARE MODE", ["locking", 0, "of"], []],
+#   ["SELECT * FROM a CROSS APPLY b", ["from", 0, "kind"], "CROSS APPLY"],
+#   ["SELECT * FROM a OUTER APPLY b", ["from", 0, "kind"], "OUTER APPLY"],
+#   ["SELECT * FROM a CROSS APPLY f(a.x) g", ["from", 0, "right", "type"], "table_function"],
+#   ["SELECT * FROM a STRAIGHT_JOIN b ON a.x = b.x", ["from", 0, "kind"], "STRAIGHT_JOIN"],
+#   ["SELECT * FROM a STRAIGHT_JOIN b", ["from", 0, "right", "alias"], None],
+#   ["SELECT * FROM a CROSS APPLY b", ["from", 0, "right", "alias"], None],
+#   ["SELECT * FROM t WITH (NOLOCK)", ["from", 0, "hints"], "NOLOCK"],
+#   ["SELECT * FROM t x WITH (NOLOCK)", ["from", 0, "alias"], "x"],
+#   ["SELECT * FROM t", ["from", 0, "hints"], None],
+#   ["SELECT * FROM t TABLESAMPLE SYSTEM (10)", ["from", 0, "tablesample", "method"], "SYSTEM"],
+#   ["SELECT * FROM t TABLESAMPLE SYSTEM (10)", ["from", 0, "tablesample", "args", 0, "value"], "10"],
+#   ["SELECT * FROM t TABLESAMPLE BERNOULLI (5) REPEATABLE (7)", ["from", 0, "tablesample", "repeatable", "value"], "7"],
+#   ["SELECT * FROM t TABLESAMPLE SYSTEM (10)", ["from", 0, "tablesample", "repeatable"], None],
+#   ["SELECT * FROM t", ["from", 0, "tablesample"], None],
+#   ["SELECT * FROM t TABLESAMPLE SYSTEM (1)", ["from", 0, "alias"], None],
+#   ["SELECT * FROM f(1) AS g (a, b)", ["from", 0, "columns"], ["a", "b"]],
+#   ["SELECT * FROM f(1) g", ["from", 0, "columns"], []],
+#   ["WITH c AS (SELECT 1) INSERT INTO t VALUES (1)", ["type"], "insert"],
+#   ["WITH c AS (SELECT 1) INSERT INTO t VALUES (1)", ["with", 0, "name"], "c"],
+#   ["WITH RECURSIVE c AS (SELECT 1) DELETE FROM t", ["recursive"], true],
+#   ["WITH c AS (SELECT 1) DELETE FROM t", ["recursive"], false],
+#   ["WITH c AS (SELECT 1) DELETE FROM t", ["type"], "delete"],
+#   ["WITH c AS (SELECT 1) UPDATE t SET a = 1", ["type"], "update"],
+#   ["WITH a AS (SELECT 1), b AS (SELECT 2) UPDATE t SET x = 1", ["with", 1, "name"], "b"],
+#   ["WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c", ["source", "type"], "select"],
+#   ["INSERT INTO t VALUES (1)", ["with"], []],
+#   ["UPDATE t SET a = 1", ["with"], []],
+#   ["DELETE FROM t", ["recursive"], false],
+#   ["WITH c AS (SELECT 1) SELECT * FROM c", ["type"], "select"],
+#   ["WITH c AS (SELECT 1) SELECT 1 UNION SELECT 2", ["type"], "set_op"],
+#   ["INSERT INTO t SET a = 1, b = 2", ["set", 1, "column"], "b"],
+#   ["INSERT INTO t SET a = 1", ["source"], None],
+#   ["INSERT INTO t VALUES (1)", ["set"], []],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT pk DO NOTHING", ["on_conflict", "constraint"], "pk"],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT (a) DO NOTHING", ["on_conflict", "constraint"], None],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT pk DO UPDATE SET a = 2", ["on_conflict", "action"], "UPDATE"],
+#   ["UPDATE t SET (a, b) = (1, 2)", ["set", 0, "columns"], ["a", "b"]],
+#   ["UPDATE t SET (a, b) = (1, 2)", ["set", 0, "column"], None],
+#   ["UPDATE t SET (a, b) = (1, 2)", ["set", 0, "value", "type"], "tuple"],
+#   ["UPDATE t SET (a, b) = (SELECT 1, 2)", ["set", 0, "value", "type"], "subquery"],
+#   ["UPDATE t SET a = 1", ["set", 0, "columns"], []],
+#   ["UPDATE t SET a = 1 ORDER BY b LIMIT 1", ["order_by", 0, "expr", "parts"], ["b"]],
+#   ["UPDATE t SET a = 1 ORDER BY b LIMIT 1", ["limit", "value"], "1"],
+#   ["UPDATE t SET a = 1", ["limit"], None],
+#   ["UPDATE t SET a = 1 WHERE c ORDER BY b", ["where", "parts"], ["c"]],
+#   ["UPDATE t SET a = 1 LIMIT 3 RETURNING a", ["returning", 0, "expr", "parts"], ["a"]],
+#   ["DELETE FROM t ORDER BY b LIMIT 2", ["limit", "value"], "2"],
+#   ["DELETE FROM t WHERE a ORDER BY b DESC", ["order_by", 0, "direction"], "DESC"],
+#   ["DELETE FROM t", ["order_by"], []],
+#   ["CREATE INDEX i ON t (a) INCLUDE (b, c)", ["include"], ["b", "c"]],
+#   ["CREATE INDEX i ON t (a)", ["include"], []],
+#   ["CREATE INDEX i ON t (a COLLATE \"C\")", ["columns", 0, "expr", "type"], "collate"],
+#   ["CREATE INDEX i ON t (a) INCLUDE (b) WHERE a > 0", ["where", "op"], ">"],
+#   ["CREATE TABLE a (x INT, LIKE b)", ["constraints", 0, "kind"], "other"],
+#   ["CREATE TABLE a (x INT, LIKE b INCLUDING ALL)", ["constraints", 0, "sql"], "LIKE b INCLUDING ALL"],
+#   ["CREATE TABLE a (x INT, EXCLUDE USING gist (c WITH &&))", ["constraints", 0, "sql"], "EXCLUDE USING gist(c WITH &&)"],
+#   ["ALTER TABLE t ALTER COLUMN a TYPE int USING a::int", ["actions", 0, "sql"], "ALTER COLUMN a TYPE int USING a::int"]
+# ])
+def test_statement_shape_dialects(sql, path, expected):
+  assert_eq(_path(first(sql_ast(sql)), path), expected)
+end
+
+# More syntax errors raise
+# @parametrize([
+#   ["UPDATE t JOIN u ON t.id = u.id SET t.a = 1"],
+#   ["DELETE t FROM t JOIN u ON t.id = u.id"],
+#   ["SELECT a FROM t ORDER BY a USING <"],
+#   ["SELECT * FROM ROWS FROM (f(), g())"],
+#   ["DROP TABLE t CASCADE CONSTRAINTS"],
+#   ["SELECT 'a"],
+#   ["SELECT E'a"],
+#   ["SELECT E'a\\'"],
+#   ["SELECT $tag$a"],
+#   ["SELECT $$a"],
+#   ["SELECT ARRAY[1"],
+#   ["SELECT a[1"],
+#   ["SELECT a[1:2"],
+#   ["SELECT x = ANY(1"],
+#   ["SELECT x = ANY (SELECT 1"],
+#   ["SELECT a COLLATE"],
+#   ["SELECT a AT TIME ZONE"],
+#   ["SELECT a AT TIME"],
+#   ["SELECT f(a ORDER BY)"],
+#   ["SELECT f(a ORDER BY b"],
+#   ["SELECT f(a) WITHIN GROUP (ORDER BY"],
+#   ["WITH c AS (SELECT 1) TRUNCATE t"],
+#   ["WITH c AS (SELECT 1)"],
+#   ["WITH c AS (SELECT 1) INSERT INTO"],
+#   ["INSERT INTO t SET"],
+#   ["INSERT INTO t SET a"],
+#   ["UPDATE t SET (a, b) 1"],
+#   ["UPDATE t SET (a, b) ="],
+#   ["UPDATE t SET a = 1 ORDER BY"],
+#   ["UPDATE t SET a = 1 LIMIT"],
+#   ["DELETE FROM t ORDER"],
+#   ["INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT"],
+#   ["SELECT * FROM a CROSS APPLY"],
+#   ["SELECT * FROM a STRAIGHT_JOIN"],
+#   ["SELECT * FROM t WITH (NOLOCK"],
+#   ["SELECT * FROM t TABLESAMPLE SYSTEM"],
+#   ["SELECT * FROM t TABLESAMPLE SYSTEM ("],
+#   ["SELECT TOP 5"],
+#   ["SELECT TOP 5 FROM t"],
+#   ["SELECT a FROM t GROUP BY a WITH"],
+#   ["SELECT a FROM t LOCK IN SHARE"],
+#   ["CREATE INDEX i ON t (a) INCLUDE (b"],
+#   ["SELECT x'FF"],
+#   ["SELECT N'abc"],
+#   ["SELECT 1 +"],
+#   ["SELECT a[]"]
+# ])
+def test_syntax_error_dialects(sql):
+  assert_eq(try: sql_ast(sql) catch: "error", "error")
+end
+
+# ===========================================================================
+# Quoted identifiers are preserved
+# ===========================================================================
+
+# Quoted names print back exactly as written
+# @parametrize([
+#   ["SELECT \"Users\".\"Id\" FROM \"Users\" WHERE \"Id\" = 1"],
+#   ["SELECT `a`, `B` FROM `db`.`T`"],
+#   ["SELECT [a], [B] FROM [dbo].[T]"],
+#   ["SELECT A, Tbl.B FROM Tbl AS T"],
+#   ["SELECT \"a b\", \"select\", \"from\" FROM \"my tbl\""],
+#   ["SELECT \"a\"\"b\" FROM t"],
+#   ["SELECT `a``b` FROM t"],
+#   ["SELECT [a]]b] FROM t"],
+#   ["SELECT a AS \"Total\", b AS `X`, c AS [Y] FROM t"],
+#   ["SELECT \"T\".* FROM \"T\""],
+#   ["SELECT * FROM \"T\" AS \"X\" INNER JOIN \"U\" AS \"V\" USING (\"Id\", b)"],
+#   ["SELECT * FROM (SELECT 1) AS \"S\" (\"A\", b)"],
+#   ["SELECT * FROM f(1) AS \"G\" (\"A\")"],
+#   ["WITH \"C\" (\"X\") AS (SELECT 1) SELECT \"X\" FROM \"C\""],
+#   ["SELECT a COLLATE \"C\" FROM t"],
+#   ["SELECT \"A\" + b, \"T\".\"C\" || 'x' FROM t"],
+#   ["INSERT INTO \"T\" (\"A\", b) VALUES (1, 2)"],
+#   ["INSERT INTO `T` SET `A` = 1"],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT (\"A\", b) DO UPDATE SET \"B\" = 2"],
+#   ["UPDATE \"T\" AS \"X\" SET \"A\" = 1, (\"B\", c) = (1, 2)"],
+#   ["UPDATE \"S\".\"T\" SET \"S\".\"T\".\"A\" = 1"],
+#   ["DELETE FROM \"T\" AS \"X\" USING \"U\""],
+#   ["CREATE INDEX \"I\" ON \"T\" (\"A\") INCLUDE (\"B\", c)"],
+#   ["CREATE VIEW \"V\" (\"A\", b) AS SELECT 1"],
+#   ["ALTER TABLE \"T\" ADD COLUMN \"C\" INT, DROP COLUMN \"D\", DROP CONSTRAINT \"E\", RENAME COLUMN \"F\" TO \"G\""],
+#   ["ALTER TABLE \"T\" RENAME TO \"U\""],
+#   ["DROP TABLE \"A\", \"B\".\"C\", d"],
+#   ["DROP INDEX \"I\" ON \"T\""],
+#   ["TRUNCATE TABLE \"A\", b"],
+#   ["COMMENT ON COLUMN \"T\".\"C\" IS 'x'"],
+#   ["COMMENT ON TABLE `T` IS NULL"]
+# ])
+def test_quoted_names_round_trip(sql):
+  assert_eq(sql_stringify(first(sql_ast(sql))), sql)
+end
+
+# Quoted names in CREATE TABLE
+# @parametrize([
+#   ["CREATE TABLE \"T\" (\"A\" INT PRIMARY KEY, `b` INT REFERENCES \"O\" (\"X\"), [c] INT)", "CREATE TABLE \"T\" (\n  \"A\" INT PRIMARY KEY,\n  `b` INT REFERENCES \"O\" (\"X\"),\n  [c] INT\n)"],
+#   ["CREATE TABLE \"S\".\"T\" (\"A\" INT, UNIQUE (\"A\"), FOREIGN KEY (\"A\") REFERENCES \"O\" (\"X\"))", "CREATE TABLE \"S\".\"T\" (\n  \"A\" INT,\n  UNIQUE (\"A\"),\n  FOREIGN KEY (\"A\") REFERENCES \"O\" (\"X\")\n)"],
+#   ["CREATE TABLE T (A INT, b INT)", "CREATE TABLE T (\n  A INT,\n  b INT\n)"]
+# ])
+def test_quoted_names_create_table(sql, expected):
+  assert_eq(sql_stringify(first(sql_ast(sql))), expected)
+end
+
+def _expr_of3(sql):
+  first(first(sql_ast("SELECT " + sql))["columns"])["expr"]
+end
+
+# Quote style per name part: false for a bare word, otherwise the quote character
+# @parametrize([
+#   ["\"A\"", ["parts_quoted"], ["\""]],
+#   ["a", ["parts_quoted"], [false]],
+#   ["`a`.b", ["parts_quoted"], ["`", false]],
+#   ["[a].[b].c", ["parts_quoted"], ["[", "[", false]],
+#   ["\"t\".*", ["table_quoted"], ["\""]],
+#   ["t.*", ["table_quoted"], [false]],
+#   ["a COLLATE \"C\"", ["collation_quoted"], ["\""]],
+#   ["a COLLATE c", ["collation_quoted"], [false]]
+# ])
+def test_quoted_flags_in_expressions(sql, path, expected):
+  assert_eq(_path(_expr_of3(sql), path), expected)
+end
+
+# Quote style on statement nodes
+# @parametrize([
+#   ["SELECT a AS \"B\"", ["columns", 0, "alias_quoted"], "\""],
+#   ["SELECT a AS b", ["columns", 0, "alias_quoted"], false],
+#   ["SELECT a `b`", ["columns", 0, "alias_quoted"], "`"],
+#   ["SELECT * FROM \"T\"", ["from", 0, "name_quoted"], ["\""]],
+#   ["SELECT * FROM s.\"T\"", ["from", 0, "name_quoted"], [false, "\""]],
+#   ["SELECT * FROM t AS [x]", ["from", 0, "alias_quoted"], "["],
+#   ["SELECT * FROM a JOIN b USING (\"X\", y)", ["from", 0, "using_quoted"], ["\"", false]],
+#   ["SELECT * FROM (SELECT 1) s (\"A\", b)", ["from", 0, "columns_quoted"], ["\"", false]],
+#   ["SELECT * FROM (SELECT 1) AS \"S\"", ["from", 0, "alias_quoted"], "\""],
+#   ["WITH \"C\" (\"X\") AS (SELECT 1) SELECT 1", ["with", 0, "name_quoted"], "\""],
+#   ["WITH \"C\" (\"X\", y) AS (SELECT 1) SELECT 1", ["with", 0, "columns_quoted"], ["\"", false]],
+#   ["INSERT INTO \"T\" (\"A\", b) VALUES (1, 2)", ["table_quoted"], ["\""]],
+#   ["INSERT INTO \"T\" (\"A\", b) VALUES (1, 2)", ["columns_quoted"], ["\"", false]],
+#   ["INSERT INTO t (a) VALUES (1) ON CONFLICT (\"A\") DO NOTHING", ["on_conflict", "target_quoted"], ["\""]],
+#   ["UPDATE \"T\" AS \"X\" SET \"A\" = 1", ["table_quoted"], ["\""]],
+#   ["UPDATE \"T\" AS \"X\" SET \"A\" = 1", ["alias_quoted"], "\""],
+#   ["UPDATE t SET \"A\" = 1", ["set", 0, "column_quoted"], ["\""]],
+#   ["UPDATE t SET (\"A\", b) = (1, 2)", ["set", 0, "columns_quoted"], ["\"", false]],
+#   ["DELETE FROM \"T\" AS `x`", ["alias_quoted"], "`"],
+#   ["CREATE TABLE \"T\" (a INT)", ["name_quoted"], ["\""]],
+#   ["CREATE TABLE s.\"T\" (a INT)", ["name_quoted"], [false, "\""]],
+#   ["CREATE TABLE t (\"A\" INT, b INT)", ["columns", 0, "name_quoted"], "\""],
+#   ["CREATE TABLE t (\"A\" INT, b INT)", ["columns", 1, "name_quoted"], false],
+#   ["CREATE TABLE t (a INT REFERENCES \"O\" (\"X\"))", ["columns", 0, "references", "table_quoted"], ["\""]],
+#   ["CREATE TABLE t (a INT REFERENCES \"O\" (\"X\"))", ["columns", 0, "references", "columns_quoted"], ["\""]],
+#   ["CREATE TABLE t (a INT, PRIMARY KEY (\"A\"))", ["constraints", 0, "columns_quoted"], ["\""]],
+#   ["CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES \"O\" (\"X\"))", ["constraints", 0, "ref_table_quoted"], ["\""]],
+#   ["CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES \"O\" (\"X\"))", ["constraints", 0, "ref_columns_quoted"], ["\""]],
+#   ["CREATE INDEX \"I\" ON \"T\" (\"A\") INCLUDE (\"B\")", ["name_quoted"], ["\""]],
+#   ["CREATE INDEX \"I\" ON \"T\" (\"A\") INCLUDE (\"B\")", ["table_quoted"], ["\""]],
+#   ["CREATE INDEX \"I\" ON \"T\" (\"A\") INCLUDE (\"B\")", ["include_quoted"], ["\""]],
+#   ["CREATE VIEW \"V\" (\"A\") AS SELECT 1", ["name_quoted"], ["\""]],
+#   ["CREATE VIEW \"V\" (\"A\") AS SELECT 1", ["columns_quoted"], ["\""]],
+#   ["ALTER TABLE \"T\" DROP COLUMN \"C\"", ["name_quoted"], ["\""]],
+#   ["ALTER TABLE \"T\" DROP COLUMN \"C\"", ["actions", 0, "name_quoted"], "\""],
+#   ["ALTER TABLE t DROP COLUMN c", ["actions", 0, "name_quoted"], false],
+#   ["ALTER TABLE t RENAME COLUMN \"A\" TO `B`", ["actions", 0, "from_quoted"], "\""],
+#   ["ALTER TABLE t RENAME COLUMN \"A\" TO `B`", ["actions", 0, "to_quoted"], "`"],
+#   ["ALTER TABLE t RENAME TO \"U\"", ["actions", 0, "to_quoted"], "\""],
+#   ["DROP TABLE \"A\", b", ["names_quoted"], [["\""], [false]]],
+#   ["DROP INDEX i ON \"T\"", ["on_table_quoted"], ["\""]],
+#   ["TRUNCATE TABLE \"A\", s.b", ["tables_quoted"], [["\""], [false, false]]],
+#   ["COMMENT ON COLUMN \"T\".\"C\" IS 'x'", ["name_quoted"], ["\"", "\""]]
+# ])
+def test_quoted_flags_in_statements(sql, path, expected):
+  assert_eq(_path(first(sql_ast(sql)), path), expected)
+end
+
+# ===========================================================================
+# Details that used to be dropped are kept
+# ===========================================================================
+
+# Printed exactly as written
+# @parametrize([
+#   ["SELECT ALL a FROM t"],
+#   ["SELECT DISTINCT a FROM t"],
+#   ["SELECT a FROM t"],
+#   ["SELECT * FROM a JOIN b ON TRUE"],
+#   ["SELECT * FROM a INNER JOIN b ON TRUE"],
+#   ["SELECT * FROM a LEFT JOIN b ON TRUE"],
+#   ["SELECT * FROM a LEFT OUTER JOIN b ON TRUE"],
+#   ["SELECT * FROM a RIGHT JOIN b ON TRUE"],
+#   ["SELECT * FROM a RIGHT OUTER JOIN b ON TRUE"],
+#   ["SELECT * FROM a FULL JOIN b ON TRUE"],
+#   ["SELECT * FROM a FULL OUTER JOIN b ON TRUE"],
+#   ["SELECT * FROM a NATURAL JOIN b"],
+#   ["SELECT * FROM a NATURAL LEFT OUTER JOIN b"],
+#   ["SELECT * FROM a CROSS JOIN b"],
+#   ["SELECT a FROM t LIMIT ALL"],
+#   ["SELECT a FROM t LIMIT 5 OFFSET 3 ROWS"],
+#   ["SELECT a FROM t OFFSET 1 ROW"],
+#   ["SELECT a FROM t OFFSET 1"],
+#   ["SELECT a FROM t FETCH FIRST 5 ROWS ONLY"],
+#   ["SELECT a FROM t FETCH NEXT 5 ROWS ONLY"],
+#   ["SELECT a FROM t FETCH FIRST ROW ONLY"],
+#   ["SELECT a FROM t FETCH NEXT 1 ROWS WITH TIES"],
+#   ["WITH c AS MATERIALIZED (SELECT 1) SELECT * FROM c"],
+#   ["WITH c AS NOT MATERIALIZED (SELECT 1) SELECT * FROM c"],
+#   ["WITH c AS (SELECT 1) SELECT * FROM c"],
+#   ["SELECT * FROM ONLY t"],
+#   ["SELECT * FROM ONLY t AS x, ONLY u"],
+#   ["UPDATE ONLY t SET a = 1"],
+#   ["UPDATE t SET a = 1"],
+#   ["DELETE FROM ONLY t"],
+#   ["DELETE FROM t"],
+#   ["ALTER TABLE ONLY t DROP COLUMN c"],
+#   ["ALTER TABLE t DROP COLUMN c"],
+#   ["TRUNCATE TABLE ONLY t"],
+#   ["TRUNCATE TABLE t"],
+#   ["CREATE INDEX i ON ONLY t (a)"],
+#   ["CREATE INDEX i ON t (a)"]
+# ])
+def test_details_round_trip(sql):
+  assert_eq(sql_stringify(first(sql_ast(sql))), sql)
+end
+
+# CREATE TABLE details
+# @parametrize([
+#   ["CREATE TABLE a (b INT GENERATED ALWAYS AS (id + 1) STORED)", "CREATE TABLE a (\n  b INT GENERATED ALWAYS AS (id + 1) STORED\n)"],
+#   ["CREATE TABLE a (c INT AS (id * 2) VIRTUAL)", "CREATE TABLE a (\n  c INT AS (id * 2) VIRTUAL\n)"],
+#   ["CREATE TABLE a (c INT AS (id * 2))", "CREATE TABLE a (\n  c INT AS (id * 2)\n)"],
+#   ["CREATE TABLE a (c INT GENERATED BY DEFAULT AS (1) STORED)", "CREATE TABLE a (\n  c INT GENERATED BY DEFAULT AS (1) STORED\n)"],
+#   ["CREATE TABLE a (i INT GENERATED ALWAYS AS IDENTITY)", "CREATE TABLE a (\n  i INT GENERATED ALWAYS AS IDENTITY\n)"],
+#   ["CREATE TABLE a (i INT GENERATED BY DEFAULT AS IDENTITY)", "CREATE TABLE a (\n  i INT GENERATED BY DEFAULT AS IDENTITY\n)"],
+#   ["CREATE TABLE a (i INT GENERATED ALWAYS AS IDENTITY (START WITH 1))", "CREATE TABLE a (\n  i INT GENERATED ALWAYS AS IDENTITY\n)"],
+#   ["CREATE TABLE a (i INT AUTO_INCREMENT)", "CREATE TABLE a (\n  i INT AUTO_INCREMENT\n)"],
+#   ["CREATE TABLE a (i INTEGER AUTOINCREMENT)", "CREATE TABLE a (\n  i INTEGER AUTOINCREMENT\n)"],
+#   ["CREATE TABLE a (u TIMESTAMP DEFAULT now() ON UPDATE now())", "CREATE TABLE a (\n  u TIMESTAMP DEFAULT now() ON UPDATE now()\n)"],
+#   ["CREATE TABLE a (u TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)", "CREATE TABLE a (\n  u TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\n)"],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB", "CREATE TABLE a (\n  id INT\n) ENGINE=InnoDB"],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC", "CREATE TABLE a (\n  id INT\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB COMMENT='x'", "CREATE TABLE a (\n  id INT\n) ENGINE=InnoDB COMMENT = 'x'"],
+#   ["CREATE TABLE a (id INT) WITH (fillfactor=70)", "CREATE TABLE a (\n  id INT\n) WITH (fillfactor = 70)"],
+#   ["CREATE TABLE a (id INT) PARTITION BY RANGE (id)", "CREATE TABLE a (\n  id INT\n) PARTITION BY RANGE(id)"],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB PARTITION BY HASH (id) PARTITIONS 4", "CREATE TABLE a (\n  id INT\n) ENGINE=InnoDB PARTITION BY HASH(id) PARTITIONS 4"],
+#   ["CREATE TABLE a (id INT) TABLESPACE ts", "CREATE TABLE a (\n  id INT\n) TABLESPACE TS"]
+# ])
+def test_details_create_table(sql, expected):
+  assert_eq(sql_stringify(first(sql_ast(sql))), expected)
+end
+
+# New fields: [statement, path, expected]
+# @parametrize([
+#   ["CREATE TABLE a (b INT GENERATED ALWAYS AS (id + 1) STORED)", ["columns", 0, "generated", "storage"], "STORED"],
+#   ["CREATE TABLE a (b INT GENERATED ALWAYS AS (id + 1) STORED)", ["columns", 0, "generated", "mode"], "ALWAYS"],
+#   ["CREATE TABLE a (b INT GENERATED ALWAYS AS (id + 1) STORED)", ["columns", 0, "generated", "expr", "op"], "+"],
+#   ["CREATE TABLE a (b INT GENERATED BY DEFAULT AS (1) STORED)", ["columns", 0, "generated", "mode"], "BY DEFAULT"],
+#   ["CREATE TABLE a (b INT AS (id * 2) VIRTUAL)", ["columns", 0, "generated", "storage"], "VIRTUAL"],
+#   ["CREATE TABLE a (b INT AS (id * 2) VIRTUAL)", ["columns", 0, "generated", "mode"], None],
+#   ["CREATE TABLE a (b INT AS (id * 2))", ["columns", 0, "generated", "storage"], None],
+#   ["CREATE TABLE a (b INT)", ["columns", 0, "generated"], None],
+#   ["CREATE TABLE a (b INT GENERATED ALWAYS AS IDENTITY)", ["columns", 0, "identity"], "ALWAYS"],
+#   ["CREATE TABLE a (b INT GENERATED BY DEFAULT AS IDENTITY)", ["columns", 0, "identity"], "BY DEFAULT"],
+#   ["CREATE TABLE a (b INT GENERATED ALWAYS AS IDENTITY)", ["columns", 0, "auto_increment"], true],
+#   ["CREATE TABLE a (b INT GENERATED ALWAYS AS IDENTITY)", ["columns", 0, "generated"], None],
+#   ["CREATE TABLE a (b INT)", ["columns", 0, "identity"], None],
+#   ["CREATE TABLE a (b INT AUTO_INCREMENT)", ["columns", 0, "auto_increment_style"], "AUTO_INCREMENT"],
+#   ["CREATE TABLE a (b INT AUTOINCREMENT)", ["columns", 0, "auto_increment_style"], "AUTOINCREMENT"],
+#   ["CREATE TABLE a (b INT)", ["columns", 0, "auto_increment_style"], None],
+#   ["CREATE TABLE a (b INT AUTO_INCREMENT)", ["columns", 0, "identity"], None],
+#   ["CREATE TABLE a (u TS DEFAULT now() ON UPDATE now())", ["columns", 0, "on_update", "name"], "now"],
+#   ["CREATE TABLE a (u TS ON UPDATE CURRENT_TIMESTAMP)", ["columns", 0, "on_update", "parts"], ["CURRENT_TIMESTAMP"]],
+#   ["CREATE TABLE a (u TS DEFAULT now())", ["columns", 0, "on_update"], None],
+#   ["CREATE TABLE a (u TS DEFAULT now() ON UPDATE now())", ["columns", 0, "default", "name"], "now"],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB", ["options", 0, "name"], "ENGINE"],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB", ["options", 0, "value"], "InnoDB"],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB", ["options", 0, "sep"], "="],
+#   ["CREATE TABLE a (id INT) ENGINE = InnoDB", ["options", 0, "value"], "InnoDB"],
+#   ["CREATE TABLE a (id INT) DEFAULT CHARSET=utf8mb4", ["options", 0, "name"], "DEFAULT CHARSET"],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB AUTO_INCREMENT=5", ["options", 1, "value"], "5"],
+#   ["CREATE TABLE a (id INT) COLLATE='x'", ["options", 0, "value"], "'x'"],
+#   ["CREATE TABLE a (id INT) WITH (fillfactor=70)", ["options", 0, "value"], "(fillfactor = 70)"],
+#   ["CREATE TABLE a (id INT) WITH (fillfactor=70)", ["options", 0, "sep"], " "],
+#   ["CREATE TABLE a (id INT) TABLESPACE ts", ["options", 0, "sep"], None],
+#   ["CREATE TABLE a (id INT)", ["options"], []],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB COMMENT='c'", ["comment"], "c"],
+#   ["CREATE TABLE a (id INT) PARTITION BY RANGE (id)", ["partition_by"], "RANGE(id)"],
+#   ["CREATE TABLE a (id INT)", ["partition_by"], None],
+#   ["CREATE TABLE a (id INT) ENGINE=InnoDB PARTITION BY HASH (id)", ["options", 0, "name"], "ENGINE"],
+#   ["WITH c AS MATERIALIZED (SELECT 1) SELECT 1", ["with", 0, "materialized"], "MATERIALIZED"],
+#   ["WITH c AS NOT MATERIALIZED (SELECT 1) SELECT 1", ["with", 0, "materialized"], "NOT MATERIALIZED"],
+#   ["WITH c AS (SELECT 1) SELECT 1", ["with", 0, "materialized"], None],
+#   ["SELECT * FROM ONLY t", ["from", 0, "only"], true],
+#   ["SELECT * FROM t", ["from", 0, "only"], false],
+#   ["SELECT * FROM ONLY t", ["from", 0, "name"], "t"],
+#   ["UPDATE ONLY t SET a = 1", ["only"], true],
+#   ["UPDATE t SET a = 1", ["only"], false],
+#   ["DELETE FROM ONLY t", ["only"], true],
+#   ["DELETE FROM t", ["only"], false],
+#   ["ALTER TABLE ONLY t DROP COLUMN c", ["only"], true],
+#   ["ALTER TABLE t DROP COLUMN c", ["only"], false],
+#   ["TRUNCATE ONLY t", ["only"], true],
+#   ["TRUNCATE t", ["only"], false],
+#   ["CREATE INDEX i ON ONLY t (a)", ["only"], true],
+#   ["CREATE INDEX i ON t (a)", ["only"], false],
+#   ["SELECT a FROM t LIMIT ALL", ["limit", "kind"], "all"],
+#   ["SELECT a FROM t LIMIT 1", ["limit", "kind"], "number"],
+#   ["SELECT a FROM t OFFSET 1 ROW", ["offset_rows"], "ROW"],
+#   ["SELECT a FROM t OFFSET 1 ROWS", ["offset_rows"], "ROWS"],
+#   ["SELECT a FROM t OFFSET 1", ["offset_rows"], None],
+#   ["SELECT a FROM t FETCH NEXT 1 ROWS ONLY", ["fetch", "next"], true],
+#   ["SELECT a FROM t FETCH FIRST 1 ROWS ONLY", ["fetch", "next"], false],
+#   ["SELECT a FROM t FETCH FIRST 1 ROW ONLY", ["fetch", "unit"], "ROW"],
+#   ["SELECT a FROM t FETCH FIRST ROW ONLY", ["fetch", "unit"], "ROW"],
+#   ["SELECT a FROM t FETCH FIRST 5 ROWS ONLY", ["fetch", "unit"], "ROWS"],
+#   ["SELECT ALL a FROM t", ["select_all"], true],
+#   ["SELECT a FROM t", ["select_all"], false],
+#   ["SELECT DISTINCT a FROM t", ["select_all"], false],
+#   ["SELECT * FROM a JOIN b ON 1", ["from", 0, "inner"], false],
+#   ["SELECT * FROM a INNER JOIN b ON 1", ["from", 0, "inner"], true],
+#   ["SELECT * FROM a JOIN b ON 1", ["from", 0, "outer"], false],
+#   ["SELECT * FROM a LEFT JOIN b ON 1", ["from", 0, "outer"], false],
+#   ["SELECT * FROM a LEFT OUTER JOIN b ON 1", ["from", 0, "outer"], true],
+#   ["SELECT * FROM a LEFT OUTER JOIN b ON 1", ["from", 0, "kind"], "LEFT"],
+#   ["SELECT * FROM a FULL OUTER JOIN b ON 1", ["from", 0, "outer"], true],
+#   ["SELECT * FROM a CROSS JOIN b", ["from", 0, "inner"], false],
+#   ["SELECT * FROM a NATURAL JOIN b", ["from", 0, "inner"], false]
+# ])
+def test_details_shape(sql, path, expected):
+  assert_eq(_path(first(sql_ast(sql)), path), expected)
+end
