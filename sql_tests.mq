@@ -159,6 +159,26 @@ def test_ast_arithmetic_precedence():
   | assert_eq(e["right"]["op"], "*")
 end
 
+def test_ast_bitwise_operators_are_left_associative():
+  let e = _expr("a & b | c")
+  | assert_eq(e["op"], "|")
+  | assert_eq(e["left"]["op"], "&")
+end
+
+def test_ast_glob():
+  assert_eq([_expr("a GLOB 'x*'")["op"], _expr("a NOT GLOB 'x*'")["op"], _expr("glob('x*', a)")["type"]], ["GLOB", "NOT GLOB", "call"])
+end
+
+def test_ast_is_with_expression():
+  let e = _expr("a IS NOT b + 1")
+  | assert_eq(e["op"], "IS NOT")
+  | assert_eq(e["right"]["op"], "+")
+end
+
+def test_stringify_sqlite_operators():
+  assert_eq(_p("SELECT a & b | c, x GLOB 'y', a IS b FROM t"), "SELECT a & b | c, x GLOB 'y', a IS b FROM t;")
+end
+
 def test_ast_literals():
   assert_eq(_expr("'it''s'"), {"type": "literal", "kind": "string", "value": "it's"})
   | assert_eq(_expr("1.5e3")["value"], "1.5e3")
@@ -1220,7 +1240,6 @@ end
 #   ["SELECT a BETWEEN 1 OR 2"],
 #   ["SELECT a IN 1"],
 #   ["SELECT a IN ("],
-#   ["SELECT a IS 1"],
 #   ["SELECT CAST(a int)"],
 #   ["SELECT CAST(a AS)"],
 #   ["SELECT f(1"],
