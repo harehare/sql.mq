@@ -439,7 +439,7 @@ module sql_tok:
       ["select", "from", "where", "group", "order", "by", "having", "limit", "offset", "union", "intersect",
         "except", "join", "inner", "left", "right", "full", "cross", "natural", "on", "using", "window",
         "returning", "set", "values", "fetch", "for", "into", "and", "or", "not", "when", "then", "else",
-        "end", "as", "is", "in", "between", "like", "ilike", "case", "exists", "null", "true", "false",
+        "end", "as", "is", "in", "between", "like", "ilike", "glob", "case", "exists", "null", "true", "false",
         "distinct", "all", "with", "table", "create", "insert", "update", "delete", "drop", "alter",
         "lateral", "primary", "foreign", "references", "check", "default", "unique", "constraint", "over",
         "filter", "partition", "asc", "desc", "nulls", "only", "conflict", "do", "nothing", "outer", "escape",
@@ -506,12 +506,12 @@ module sql_parser:
       elif (k == "is"): [4, "is", "IS", 1]
       elif (k == "between"): [4, "between", "BETWEEN", 1]
       elif (k == "in"): [4, "in", "IN", 1]
-      elif (k == "like" || k == "ilike"): [4, "like", upcase(k), 1]
+      elif (k == "like" || k == "ilike" || k == "glob"): [4, "like", upcase(k), 1]
       elif (k == "similar" && nk == "to"): [4, "like", "SIMILAR TO", 2]
       elif (k == "not" && nk == "between"): [4, "between", "NOT BETWEEN", 2]
       elif (k == "not" && nk == "in"): [4, "in", "NOT IN", 2]
-      elif (k == "not" && (nk == "like" || nk == "ilike")): [4, "like", "NOT " + upcase(nk), 2]
-      elif (t == "op" && contains(["||", "->", "->>", "#>", "#>>", "@>", "<@", "&&", "~", "~*", "!~", "!~*", "<<", ">>"], v)): [5, "bin", v, 1]
+      elif (k == "not" && (nk == "like" || nk == "ilike" || nk == "glob")): [4, "like", "NOT " + upcase(nk), 2]
+      elif (t == "op" && contains(["||", "->", "->>", "#>", "#>>", "@>", "<@", "&&", "~", "~*", "!~", "!~*", "<<", ">>", "&", "|"], v)): [5, "bin", v, 1]
       elif (t == "op" && (v == "+" || v == "-")): [6, "bin", v, 1]
       elif (t == "op" && (v == "*" || v == "/" || v == "%")): [7, "bin", v, 1]
       elif (t == "op" && v == "^"): [8, "bin", v, 1]
@@ -626,7 +626,10 @@ module sql_parser:
             elif (k == "null" || k == "true" || k == "false" || k == "unknown"):
               [j + 1, {"type": "is", "expr": left, "negated": neg, "what": upcase(k)}]
             else:
-              sql::sql_tok::err(toks, j, "expected NULL, TRUE, FALSE or DISTINCT FROM after IS")
+              do
+                let r = parse_bp(toks, j, 5)
+                | [r[0], {"type": "binary", "op": if (neg): "IS NOT" else: "IS", "left": left, "right": r[1]}]
+              end
         end
   end
 
@@ -943,7 +946,7 @@ module sql_parser:
           | [pos + (if (has_unit): 3 else: 2),
             {"type": "typed_literal", "data_type": upcase(k), "value": toks[pos + 1]["v"], "unit": if (has_unit): upcase(uk) else: None}]
         end
-      elif (t == "word" && sql::sql_tok::type_at(toks, pos + 1) != "(" && contains(["select", "from", "where", "group", "order", "by", "having", "limit", "offset", "union", "intersect", "except", "join", "inner", "cross", "natural", "on", "using", "returning", "set", "values", "into", "and", "or", "when", "then", "else", "end", "as", "is", "in", "between", "like", "with", "create", "insert", "update", "delete", "drop", "alter"], k)):
+      elif (t == "word" && sql::sql_tok::type_at(toks, pos + 1) != "(" && contains(["select", "from", "where", "group", "order", "by", "having", "limit", "offset", "union", "intersect", "except", "join", "inner", "cross", "natural", "on", "using", "returning", "set", "values", "into", "and", "or", "when", "then", "else", "end", "as", "is", "in", "between", "like", "glob", "with", "create", "insert", "update", "delete", "drop", "alter"], k)):
         sql::sql_tok::err(toks, pos, "unexpected keyword in expression")
       elif (t == "word" || t == "qid"):
         parse_ref(toks, pos)
@@ -2138,7 +2141,7 @@ module sql_printer:
   def op_bp(op):
     if (op == "OR"): 1
     elif (op == "AND"): 2
-    elif (contains(["||", "->", "->>", "#>", "#>>", "@>", "<@", "&&", "~", "~*", "!~", "!~*", "<<", ">>"], op)): 5
+    elif (contains(["||", "->", "->>", "#>", "#>>", "@>", "<@", "&&", "~", "~*", "!~", "!~*", "<<", ">>", "&", "|"], op)): 5
     elif (op == "+" || op == "-"): 6
     elif (op == "*" || op == "/" || op == "%"): 7
     elif (op == "^"): 8
