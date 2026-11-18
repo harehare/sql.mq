@@ -169,6 +169,10 @@ def test_ast_glob():
   assert_eq([_expr("a GLOB 'x*'")["op"], _expr("a NOT GLOB 'x*'")["op"], _expr("glob('x*', a)")["type"]], ["GLOB", "NOT GLOB", "call"])
 end
 
+def test_ast_match():
+  assert_eq([_expr("docs MATCH 'a b'")["op"], _expr("a NOT MATCH 'x'")["op"], _expr("a MATCH 'x' AND b = 1")["op"]], ["MATCH", "NOT MATCH", "AND"])
+end
+
 def test_ast_is_with_expression():
   let e = _expr("a IS NOT b + 1")
   | assert_eq(e["op"], "IS NOT")
